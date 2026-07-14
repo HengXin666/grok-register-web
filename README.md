@@ -146,6 +146,12 @@ python -m unittest discover -s tests -v
 - 账号、Token、密码仅存本地 `data/`，请勿把运行时数据提交到公开仓库  
 - Cloudflare 托管挑战无法保证全自动，请用「推荐用法」分流  
 
+## 致谢
+
+- 本项目在社区讨论与既有开源方案启发下完成二次开发 / Web 化改造
+- 感谢 [LINUX DO](https://linux.do/) 社区
+- 上游参考：[AaronL725/grok-register](https://github.com/AaronL725/grok-register)
+
 ## License
 
 [MIT](LICENSE)
