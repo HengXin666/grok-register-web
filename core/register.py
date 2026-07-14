@@ -5,6 +5,7 @@ import string
 import random
 import secrets
 import re
+from contextlib import contextmanager
 
 from DrissionPage.errors import PageDisconnectedError
 from config import SIGNUP_URL
@@ -12,6 +13,29 @@ from core.grok2api_client import upload_registered_sso
 from core.account_activation import activate_grok_web
 
 logger = logging.getLogger('register')
+
+_EMAIL_REQUEST_LOCK = threading.Lock()
+_EMAIL_REQUEST_LAST_AT = 0.0
+EMAIL_REQUEST_MIN_INTERVAL = 12.0
+
+
+@contextmanager
+def email_request_slot(min_interval=EMAIL_REQUEST_MIN_INTERVAL):
+    """Serialize xAI send-code requests across concurrent browser workers."""
+    global _EMAIL_REQUEST_LAST_AT
+    with _EMAIL_REQUEST_LOCK:
+        wait_for = max(
+            0.0,
+            _EMAIL_REQUEST_LAST_AT + float(min_interval) - time.monotonic(),
+        )
+        if wait_for:
+            logger.info(
+                'Waiting %.1fs before next xAI verification-code request',
+                wait_for,
+            )
+            time.sleep(wait_for)
+        _EMAIL_REQUEST_LAST_AT = time.monotonic()
+        yield
 
 
 def submit_is_in_flight(ui_state):
@@ -761,13 +785,14 @@ return {clicked: true, label: (target.innerText || target.textContent || '').rep
                             None,
                         )
                     if submit:
-                        submit.click()
-                        logger.info(
-                            'Filled email and clicked submit natively (%s): %s',
-                            str(submit.text or '').strip() or 'submit',
-                            email_addr,
-                        )
-                        self._wait_for_verification_request(email_addr)
+                        with email_request_slot():
+                            submit.click()
+                            logger.info(
+                                'Filled email and clicked submit natively (%s): %s',
+                                str(submit.text or '').strip() or 'submit',
+                                email_addr,
+                            )
+                            self._wait_for_verification_request(email_addr)
                         return
             except VerificationRequestError:
                 raise
@@ -820,7 +845,8 @@ return String(input.value || '').trim().length >= 50 ? 'ready' : 'pending';
                         logger.info('Turnstile pending before email submission, solving...')
                         self._solve_turnstile()
                     # Click submit/register button
-                    clicked = self.browser.run_js(r"""
+                    with email_request_slot():
+                        clicked = self.browser.run_js(r"""
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -870,7 +896,7 @@ if (!submitButton || submitButton.disabled) {
 try { submitButton.scrollIntoView({block:'center'}); } catch (e) {}
 submitButton.click();
 return {ok:true, label:(submitButton.innerText || submitButton.textContent || '').replace(/\s+/g,' ').trim()};
-                    """)
+                        """)
                     if isinstance(clicked, dict) and clicked.get('ok'):
                         logger.info(
                             "Filled email and clicked submit (%s): %s",

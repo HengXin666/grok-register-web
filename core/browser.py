@@ -10,11 +10,16 @@ class BrowserError(Exception):
 
 
 class BrowserManager:
-    def __init__(self, headless=False, extension_path=None, user_data_path=None, proxy=''):
+    def __init__(self, headless=False, extension_path=None, user_data_path=None,
+                 proxy='', stealth=False):
         self.headless = headless
         self.extension_path = extension_path
         self.user_data_path = user_data_path
         self.proxy = (proxy or '').strip()
+        # xAI's risk checks reject the common JS "stealth" patches used by
+        # automation tools. Keep this opt-in; normal registration must retain
+        # the browser's native navigator/plugin objects.
+        self.stealth = bool(stealth)
         self._browser = None
         self._page = None
 
@@ -28,6 +33,7 @@ class BrowserManager:
             extension_path=self.extension_path,
             user_data_path=user_data_path,
             proxy=self.proxy,
+            stealth=self.stealth,
         )
 
     def start(self):
@@ -107,8 +113,8 @@ class BrowserManager:
         logger.info(f"Browser started, {len(tabs)} tab(s)")
 
     def _apply_stealth_js(self, page):
-        """Hide navigator.webdriver and soft-patch common automation probes."""
-        if not page:
+        """Apply optional stealth patches (disabled for xAI by default)."""
+        if not page or not self.stealth:
             return
         script = r"""
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
