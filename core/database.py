@@ -3,6 +3,12 @@ import threading
 import logging
 from datetime import datetime, timedelta
 from config import DB_PATH
+from core.failure_policy import (
+    FAILURE_CATEGORY_MAIL_FETCH,
+    FAILURE_CATEGORY_REGISTRATION,
+    account_disable_reason,
+    classify_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +18,10 @@ DEFAULT_SETTINGS = {
     'max_confirm_retries': '3',
     'max_retries_per_alias': '3',
     'registration_timeout': '300',
+    'registration_concurrency': '2',
     'browser_headless': 'false',
     'turnstile_auto': 'true',
     'random_name_enabled': 'true',
-    'email_provider': 'hotmail',
     'extract_numbers_enabled': 'false',
     'password_mode': 'auto',
     'manual_password': '',
@@ -34,6 +40,8 @@ DEFAULT_SETTINGS = {
     'browser_proxy': '',
 }
 
+DEPRECATED_SETTING_KEYS = ('email_provider',)
+
 
 class Database:
     _instance = None
@@ -51,7 +59,7 @@ class Database:
         if self._initialized:
             return
         self._initialized = True
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         import os
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -83,9 +91,13 @@ class Database:
                     status TEXT DEFAULT 'ready',
                     sso_value TEXT DEFAULT '',
                     error_reason TEXT DEFAULT '',
+                    failure_category TEXT DEFAULT '',
                     retry_count INTEGER DEFAULT 0,
+                    lease_owner TEXT DEFAULT '',
+                    lease_expires_at DATETIME,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    used_at DATETIME
+                    used_at DATETIME,
+                    completed_at DATETIME
                 );
 
                 CREATE TABLE IF NOT EXISTS registrations (
@@ -118,13 +130,64 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_registrations_created
                     ON registrations(created_at);
             ''')
+            self._migrate_alias_terminal_metadata(cur)
+            cur.execute(
+                '''CREATE UNIQUE INDEX IF NOT EXISTS idx_aliases_active_account
+                   ON aliases(account_id) WHERE status = 'processing' '''
+            )
+            cur.execute(
+                '''CREATE INDEX IF NOT EXISTS idx_aliases_lease_expiry
+                   ON aliases(status, lease_expires_at)'''
+            )
             for key, value in DEFAULT_SETTINGS.items():
                 cur.execute(
                     'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
                     (key, value)
                 )
+            self._remove_deprecated_settings(cur)
             self.conn.commit()
             logger.info("Database initialized successfully")
+
+    @staticmethod
+    def _remove_deprecated_settings(cursor):
+        cursor.executemany(
+            'DELETE FROM settings WHERE key = ?',
+            ((key,) for key in DEPRECATED_SETTING_KEYS),
+        )
+
+    @staticmethod
+    def _migrate_alias_terminal_metadata(cursor):
+        columns = {
+            row['name'] for row in cursor.execute('PRAGMA table_info(aliases)').fetchall()
+        }
+        if 'failure_category' not in columns:
+            cursor.execute(
+                "ALTER TABLE aliases ADD COLUMN failure_category TEXT DEFAULT ''"
+            )
+        if 'completed_at' not in columns:
+            cursor.execute('ALTER TABLE aliases ADD COLUMN completed_at DATETIME')
+        if 'lease_owner' not in columns:
+            cursor.execute("ALTER TABLE aliases ADD COLUMN lease_owner TEXT DEFAULT ''")
+        if 'lease_expires_at' not in columns:
+            cursor.execute('ALTER TABLE aliases ADD COLUMN lease_expires_at DATETIME')
+
+        rows = cursor.execute(
+            '''SELECT id, status, error_reason, failure_category,
+                      created_at, used_at, completed_at
+               FROM aliases
+               WHERE status IN ('used', 'failed')'''
+        ).fetchall()
+        for row in rows:
+            category = row['failure_category'] or (
+                classify_failure(row['error_reason'])
+                if row['status'] == 'failed' else ''
+            )
+            completed_at = row['completed_at'] or row['used_at'] or row['created_at']
+            cursor.execute(
+                '''UPDATE aliases SET failure_category=?, completed_at=?
+                   WHERE id=?''',
+                (category, completed_at, row['id']),
+            )
 
     # ── Accounts CRUD ──────────────────────────────────────────
 
@@ -197,7 +260,9 @@ class Database:
                 (account_id,)
             )
             self.conn.execute(
-                "UPDATE aliases SET status='ready', sso_value='', error_reason='', retry_count=0, used_at=NULL WHERE account_id=?",
+                """UPDATE aliases SET status='ready', sso_value='', error_reason='',
+                   failure_category='', retry_count=0, used_at=NULL, completed_at=NULL
+                   WHERE account_id=?""",
                 (account_id,)
             )
             self.conn.commit()
@@ -277,16 +342,313 @@ class Database:
 
     # ── Aliases CRUD ───────────────────────────────────────────
 
+    # Extra failed aliases allowed per account before we stop minting replacements.
+    # Prevents a dead mailbox from generating +1..+N forever (used count stays 0).
+    ALIAS_FAILURE_BUDGET = 3
+    DEFAULT_LEASE_SECONDS = 900
+
+    @staticmethod
+    def _lease_expiry(lease_seconds):
+        seconds = max(30, int(lease_seconds or Database.DEFAULT_LEASE_SECONDS))
+        return (datetime.now() + timedelta(seconds=seconds)).isoformat()
+
+    def _count_consecutive_mail_failed_aliases_locked(self, cursor, account_id):
+        rows = cursor.execute(
+            '''SELECT status, failure_category FROM aliases
+               WHERE account_id = ? AND status IN ('used', 'failed')
+               ORDER BY julianday(completed_at) DESC, id DESC''',
+            (account_id,),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if (
+                row['status'] != 'failed'
+                or row['failure_category'] != FAILURE_CATEGORY_MAIL_FETCH
+            ):
+                break
+            count += 1
+        return count
+
+    def _account_disable_reason_locked(self, cursor, account_id):
+        account = cursor.execute(
+            'SELECT id, email, status, max_aliases FROM accounts WHERE id = ?',
+            (account_id,),
+        ).fetchone()
+        if not account or account['status'] != 'ready':
+            return account, ''
+
+        counts = cursor.execute(
+            '''SELECT
+                   SUM(CASE WHEN status = 'used' THEN 1 ELSE 0 END) AS used_cnt,
+                   COUNT(*) AS total_cnt,
+                   SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS active_cnt
+               FROM aliases WHERE account_id = ?''',
+            (account_id,),
+        ).fetchone()
+        # Never disable an account while another alias is actively using its mailbox.
+        if counts['active_cnt']:
+            return account, ''
+
+        reason = account_disable_reason(
+            consecutive_mail_fails=self._count_consecutive_mail_failed_aliases_locked(
+                cursor, account_id,
+            ),
+            used_count=counts['used_cnt'] or 0,
+            total_count=counts['total_cnt'] or 0,
+            max_aliases=account['max_aliases'],
+            failure_budget=self.ALIAS_FAILURE_BUDGET,
+        )
+        return account, reason
+
+    def _disable_account_locked(self, cursor, account_id, reason):
+        completed_at = datetime.now().isoformat()
+        cursor.execute(
+            "UPDATE accounts SET status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (account_id,),
+        )
+        cursor.execute(
+            '''UPDATE aliases SET status='failed', error_reason=?,
+               failure_category=?, completed_at=?, lease_owner='', lease_expires_at=NULL
+               WHERE account_id=? AND status='ready' ''',
+            (
+                f'account disabled: {reason}',
+                FAILURE_CATEGORY_REGISTRATION,
+                completed_at,
+                account_id,
+            ),
+        )
+
+    def _maybe_disable_unusable_account_locked(self, cursor, account_id):
+        account, reason = self._account_disable_reason_locked(cursor, account_id)
+        if not reason:
+            return False, '', account
+        self._disable_account_locked(cursor, account_id, reason)
+        return True, reason, account
+
+    def _recover_expired_alias_leases_locked(self, cursor, max_retries, now_iso=None):
+        now_iso = now_iso or datetime.now().isoformat()
+        error = 'Registration worker lease expired'
+        rows = cursor.execute(
+            '''SELECT id, account_id, retry_count FROM aliases
+               WHERE status='processing'
+                 AND (lease_expires_at IS NULL
+                      OR julianday(lease_expires_at) <= julianday(?))''',
+            (now_iso,),
+        ).fetchall()
+        recovered = []
+        for row in rows:
+            cursor.execute(
+                '''UPDATE registrations SET status='failed', error_message=?
+                   WHERE alias_id=? AND status='pending' ''',
+                (error, row['id']),
+            )
+            retry_count = int(row['retry_count'] or 0) + 1
+            terminal = retry_count >= max_retries
+            if terminal:
+                cursor.execute(
+                    '''UPDATE aliases SET status='failed', retry_count=?, error_reason=?,
+                       failure_category=?, completed_at=?, used_at=NULL,
+                       lease_owner='', lease_expires_at=NULL WHERE id=?''',
+                    (
+                        retry_count,
+                        error,
+                        classify_failure(error),
+                        now_iso,
+                        row['id'],
+                    ),
+                )
+                disabled, reason, _ = self._maybe_disable_unusable_account_locked(
+                    cursor, row['account_id'],
+                )
+            else:
+                cursor.execute(
+                    '''UPDATE aliases SET status='ready', retry_count=?, error_reason='',
+                       failure_category='', completed_at=NULL, used_at=NULL,
+                       lease_owner='', lease_expires_at=NULL WHERE id=?''',
+                    (retry_count, row['id']),
+                )
+                disabled, reason = False, ''
+            recovered.append({
+                'alias_id': row['id'],
+                'account_id': row['account_id'],
+                'retry_count': retry_count,
+                'terminal': terminal,
+                'account_disabled': disabled,
+                'disable_reason': reason,
+            })
+        return recovered
+
+    def claim_next_alias(self, max_retries, lease_owner,
+                         lease_seconds=DEFAULT_LEASE_SECONDS):
+        """Atomically lease one alias while allowing only one active alias per account."""
+        if not lease_owner:
+            raise ValueError('lease_owner is required')
+
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                self._recover_expired_alias_leases_locked(cur, max_retries)
+                lease_expires_at = self._lease_expiry(lease_seconds)
+
+                row = cur.execute(
+                    '''SELECT al.*, a.client_id, a.refresh_token,
+                              a.email AS main_email,
+                              a.max_aliases AS account_max_aliases
+                       FROM aliases al
+                       JOIN accounts a ON al.account_id = a.id
+                       WHERE al.status = 'ready'
+                         AND al.retry_count < ?
+                         AND a.status = 'ready'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM aliases active
+                             WHERE active.account_id = al.account_id
+                               AND active.status = 'processing'
+                         )
+                       ORDER BY al.account_id ASC, al.alias_index ASC
+                       LIMIT 1''',
+                    (max_retries,),
+                ).fetchone()
+
+                if row:
+                    cur.execute(
+                        '''UPDATE aliases SET status='processing', lease_owner=?,
+                           lease_expires_at=? WHERE id=? AND status='ready' ''',
+                        (lease_owner, lease_expires_at, row['id']),
+                    )
+                    claimed = dict(row)
+                    claimed.update({
+                        'status': 'processing',
+                        'lease_owner': lease_owner,
+                        'lease_expires_at': lease_expires_at,
+                    })
+                    self.conn.commit()
+                    return claimed
+
+                failure_budget = self.ALIAS_FAILURE_BUDGET
+                account = cur.execute(
+                    '''SELECT a.* FROM accounts a
+                       WHERE a.status = 'ready'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM aliases active
+                             WHERE active.account_id = a.id
+                               AND active.status = 'processing'
+                         )
+                         AND (SELECT COUNT(*) FROM aliases
+                              WHERE account_id = a.id AND status = 'used') < a.max_aliases
+                         AND (SELECT COUNT(*) FROM aliases
+                              WHERE account_id = a.id) < (a.max_aliases + ?)
+                       ORDER BY a.id ASC
+                       LIMIT 1''',
+                    (failure_budget,),
+                ).fetchone()
+                if not account:
+                    self.conn.commit()
+                    return None
+
+                account_id = account['id']
+                next_index = cur.execute(
+                    'SELECT COALESCE(MAX(alias_index), -1) + 1 FROM aliases WHERE account_id = ?',
+                    (account_id,),
+                ).fetchone()[0]
+                main_email = account['email']
+                if next_index == 0:
+                    alias_email = main_email
+                else:
+                    at_pos = main_email.index('@')
+                    alias_email = f"{main_email[:at_pos]}+{next_index}{main_email[at_pos:]}"
+
+                cur.execute(
+                    '''INSERT INTO aliases (
+                           account_id, alias_email, alias_index, status,
+                           lease_owner, lease_expires_at
+                       ) VALUES (?, ?, ?, 'processing', ?, ?)''',
+                    (
+                        account_id, alias_email, next_index,
+                        lease_owner, lease_expires_at,
+                    ),
+                )
+                alias_id = cur.lastrowid
+                self.conn.commit()
+                return {
+                    'id': alias_id,
+                    'account_id': account_id,
+                    'alias_email': alias_email,
+                    'alias_index': next_index,
+                    'status': 'processing',
+                    'sso_value': '',
+                    'error_reason': '',
+                    'retry_count': 0,
+                    'lease_owner': lease_owner,
+                    'lease_expires_at': lease_expires_at,
+                    'client_id': account['client_id'],
+                    'refresh_token': account['refresh_token'],
+                    'main_email': main_email,
+                    'account_max_aliases': account['max_aliases'],
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def heartbeat_alias_lease(self, alias_id, lease_owner,
+                              lease_seconds=DEFAULT_LEASE_SECONDS):
+        with self._write_lock:
+            cur = self.conn.execute(
+                '''UPDATE aliases SET lease_expires_at=?
+                   WHERE id=? AND status='processing' AND lease_owner=?''',
+                (self._lease_expiry(lease_seconds), alias_id, lease_owner),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+
+    def release_alias_claim(self, alias_id, lease_owner):
+        with self._write_lock:
+            cur = self.conn.execute(
+                '''UPDATE aliases SET status='ready', lease_owner='', lease_expires_at=NULL
+                   WHERE id=? AND status='processing' AND lease_owner=?''',
+                (alias_id, lease_owner),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+
+    def abort_registration_attempt(self, reg_id, alias_id, lease_owner,
+                                   error, duration):
+        """Record an upstream-wide abort without consuming the claimed alias."""
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                cur.execute(
+                    '''UPDATE registrations SET status='failed', error_message=?,
+                       duration_seconds=? WHERE id=?''',
+                    (error, duration, reg_id),
+                )
+                cur.execute(
+                    '''UPDATE aliases SET status='ready', error_reason='',
+                       failure_category='', used_at=NULL, completed_at=NULL,
+                       lease_owner='', lease_expires_at=NULL
+                       WHERE id=? AND status='processing' AND lease_owner=?''',
+                    (alias_id, lease_owner),
+                )
+                released = cur.rowcount == 1
+                self.conn.commit()
+                return released
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def get_next_alias(self, max_retries):
         with self._write_lock:
             cur = self.conn.cursor()
-            # Step 1: prefer existing ready aliases
+            # Step 1: prefer existing ready aliases on non-disabled accounts
             row = cur.execute(
                 '''SELECT al.*, a.client_id, a.refresh_token, a.email AS main_email,
                           a.max_aliases AS account_max_aliases
                    FROM aliases al
                    JOIN accounts a ON al.account_id = a.id
-                   WHERE al.status = 'ready' AND al.retry_count < ?
+                   WHERE al.status = 'ready'
+                     AND al.retry_count < ?
+                     AND a.status = 'ready'
                    ORDER BY al.account_id ASC, al.alias_index ASC
                    LIMIT 1''',
                 (max_retries,)
@@ -294,14 +656,20 @@ class Database:
             if row:
                 return dict(row)
 
-            # Step 2: find an account that can still generate new aliases
-            # Allow creating replacement aliases for failed ones: only count successfully used aliases
+            # Step 2: find an account that can still generate new aliases.
+            # - Need more successful (used) aliases than max_aliases
+            # - Cap TOTAL aliases (used+failed+ready) so failures cannot mint forever
+            failure_budget = self.ALIAS_FAILURE_BUDGET
             account = cur.execute(
                 '''SELECT a.* FROM accounts a
                    WHERE a.status = 'ready'
-                     AND (SELECT COUNT(*) FROM aliases WHERE account_id = a.id AND status = 'used') < a.max_aliases
+                     AND (SELECT COUNT(*) FROM aliases
+                          WHERE account_id = a.id AND status = 'used') < a.max_aliases
+                     AND (SELECT COUNT(*) FROM aliases
+                          WHERE account_id = a.id) < (a.max_aliases + ?)
                    ORDER BY a.id ASC
-                   LIMIT 1'''
+                   LIMIT 1''',
+                (failure_budget,)
             ).fetchone()
             if not account:
                 return None
@@ -343,6 +711,39 @@ class Database:
                 'account_max_aliases': account['max_aliases'],
             }
 
+    def count_consecutive_mail_failed_aliases(self, account_id: int) -> int:
+        """Count recent terminal aliases until success or another failure breaks the streak."""
+        with self._write_lock:
+            return self._count_consecutive_mail_failed_aliases_locked(
+                self.conn.cursor(), account_id,
+            )
+
+    def maybe_disable_unusable_account(self, account_id: int, error_msg: str = '') -> bool:
+        """Disable account when mailbox is clearly unusable or alias budget exhausted.
+
+        Returns True if the account was disabled.
+        """
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                disabled, reason, account = self._maybe_disable_unusable_account_locked(
+                    cur, account_id,
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        if not disabled:
+            return False
+        logger.warning(
+            'Account %s disabled: %s (last_error=%s)',
+            account['email'] if account else account_id,
+            reason,
+            (error_msg or '')[:120],
+        )
+        return True
+
     def create_alias(self, account_id, alias_email, alias_index):
         with self._write_lock:
             cur = self.conn.cursor()
@@ -355,11 +756,19 @@ class Database:
 
     def update_alias_status(self, alias_id, status, sso='', error=''):
         with self._write_lock:
-            used_at = datetime.now().isoformat() if status == 'used' else None
+            terminal = status in ('used', 'failed')
+            completed_at = datetime.now().isoformat() if terminal else None
+            used_at = completed_at if status == 'used' else None
+            failure_category = classify_failure(error) if status == 'failed' else ''
             self.conn.execute(
-                '''UPDATE aliases SET status=?, sso_value=?, error_reason=?, used_at=?
+                '''UPDATE aliases SET status=?, sso_value=?, error_reason=?,
+                   failure_category=?, used_at=?, completed_at=?,
+                   lease_owner='', lease_expires_at=NULL
                    WHERE id=?''',
-                (status, sso, error, used_at, alias_id)
+                (
+                    status, sso, error, failure_category,
+                    used_at, completed_at, alias_id,
+                )
             )
             self.conn.commit()
 
@@ -374,7 +783,10 @@ class Database:
     def reset_aliases(self, account_id):
         with self._write_lock:
             self.conn.execute(
-                "UPDATE aliases SET status='ready', sso_value='', error_reason='', retry_count=0, used_at=NULL WHERE account_id=?",
+                """UPDATE aliases SET status='ready', sso_value='', error_reason='',
+                   failure_category='', retry_count=0, used_at=NULL, completed_at=NULL,
+                   lease_owner='', lease_expires_at=NULL
+                   WHERE account_id=?""",
                 (account_id,)
             )
             self.conn.commit()
@@ -393,9 +805,18 @@ class Database:
 
     # ── Registrations CRUD ─────────────────────────────────────
 
-    def create_registration(self, alias_id, email, password, round_number):
+    def create_registration(self, alias_id, email, password, round_number,
+                            lease_owner=None):
         with self._write_lock:
             cur = self.conn.cursor()
+            if lease_owner is not None:
+                alias = cur.execute(
+                    '''SELECT id FROM aliases
+                       WHERE id=? AND status='processing' AND lease_owner=?''',
+                    (alias_id, lease_owner),
+                ).fetchone()
+                if not alias:
+                    raise RuntimeError(f'Alias lease lost before registration: {alias_id}')
             cur.execute(
                 '''INSERT INTO registrations (alias_id, email, account_password, round_number)
                    VALUES (?, ?, ?, ?)''',
@@ -412,6 +833,124 @@ class Database:
                 (status, sso, error, duration, reg_id)
             )
             self.conn.commit()
+
+    def complete_registration_success(self, reg_id, alias_id, lease_owner,
+                                      sso, duration=0):
+        """Atomically persist a successful registration and release its alias lease."""
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                alias = cur.execute(
+                    '''SELECT account_id FROM aliases
+                       WHERE id=? AND status='processing' AND lease_owner=?''',
+                    (alias_id, lease_owner),
+                ).fetchone()
+                if not alias:
+                    raise RuntimeError(f'Alias lease lost before success commit: {alias_id}')
+
+                completed_at = datetime.now().isoformat()
+                cur.execute(
+                    '''UPDATE registrations SET status='success', sso_value=?,
+                       error_message='', duration_seconds=? WHERE id=?''',
+                    (sso, duration, reg_id),
+                )
+                cur.execute(
+                    '''UPDATE aliases SET status='used', sso_value=?, error_reason='',
+                       failure_category='', used_at=?, completed_at=?,
+                       lease_owner='', lease_expires_at=NULL WHERE id=?''',
+                    (sso, completed_at, completed_at, alias_id),
+                )
+
+                account_done = bool(cur.execute(
+                    '''SELECT 1 FROM accounts a
+                       WHERE a.id=? AND
+                         (SELECT COUNT(*) FROM aliases
+                          WHERE account_id=a.id AND status='used') >= a.max_aliases''',
+                    (alias['account_id'],),
+                ).fetchone())
+                if account_done:
+                    cur.execute(
+                        "UPDATE accounts SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (alias['account_id'],),
+                    )
+                self.conn.commit()
+                return {'account_done': account_done, 'account_id': alias['account_id']}
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def finish_registration_attempt(self, reg_id, alias_id, lease_owner,
+                                    error, duration, max_retries):
+        """Atomically fail one attempt, decide retry/terminal state, and release its lease."""
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                cur.execute(
+                    '''UPDATE registrations SET status='failed', error_message=?,
+                       duration_seconds=? WHERE id=?''',
+                    (error, duration, reg_id),
+                )
+                alias = cur.execute(
+                    '''SELECT account_id, retry_count, status, lease_owner
+                       FROM aliases WHERE id=?''',
+                    (alias_id,),
+                ).fetchone()
+                if (
+                    not alias
+                    or alias['status'] != 'processing'
+                    or alias['lease_owner'] != lease_owner
+                ):
+                    self.conn.commit()
+                    return {
+                        'lease_lost': True,
+                        'retry_count': int(alias['retry_count'] or 0) if alias else 0,
+                        'terminal': False,
+                        'account_disabled': False,
+                        'disable_reason': '',
+                    }
+
+                retry_count = int(alias['retry_count'] or 0) + 1
+                terminal = retry_count >= max_retries
+                if terminal:
+                    completed_at = datetime.now().isoformat()
+                    cur.execute(
+                        '''UPDATE aliases SET status='failed', retry_count=?,
+                           error_reason=?, failure_category=?, used_at=NULL,
+                           completed_at=?, lease_owner='', lease_expires_at=NULL
+                           WHERE id=?''',
+                        (
+                            retry_count,
+                            error,
+                            classify_failure(error),
+                            completed_at,
+                            alias_id,
+                        ),
+                    )
+                    disabled, reason, _ = self._maybe_disable_unusable_account_locked(
+                        cur, alias['account_id'],
+                    )
+                else:
+                    cur.execute(
+                        '''UPDATE aliases SET status='ready', retry_count=?,
+                           error_reason='', failure_category='', used_at=NULL,
+                           completed_at=NULL, lease_owner='', lease_expires_at=NULL
+                           WHERE id=?''',
+                        (retry_count, alias_id),
+                    )
+                    disabled, reason = False, ''
+                self.conn.commit()
+                return {
+                    'lease_lost': False,
+                    'retry_count': retry_count,
+                    'terminal': terminal,
+                    'account_disabled': disabled,
+                    'disable_reason': reason,
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def get_registrations(self, reg_type='sso'):
         if reg_type == 'sso':
@@ -472,6 +1011,7 @@ class Database:
 
     def reset_settings(self):
         with self._write_lock:
+            self._remove_deprecated_settings(self.conn)
             for key, value in DEFAULT_SETTINGS.items():
                 self.conn.execute(
                     '''INSERT INTO settings (key, value, updated_at)
@@ -483,34 +1023,95 @@ class Database:
 
     # ── Recovery ───────────────────────────────────────────────
 
-    def recover_stale(self, timeout_seconds):
+    def recover_expired_alias_leases(self, max_retries, now_iso=None):
         with self._write_lock:
-            cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).isoformat()
-            stale = self.conn.execute(
-                "SELECT id, alias_id FROM registrations WHERE status='pending' AND created_at < ?",
-                (cutoff,)
-            ).fetchall()
-            if not stale:
-                return
-            settings = self.get_settings()
-            max_retries = int(settings.get('max_retries_per_alias', DEFAULT_SETTINGS['max_retries_per_alias']))
-            for row in stale:
-                self.conn.execute(
-                    "UPDATE registrations SET status='failed', error_message='Timeout on startup recovery' WHERE id=?",
-                    (row['id'],)
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                recovered = self._recover_expired_alias_leases_locked(
+                    cur, max_retries, now_iso=now_iso,
                 )
-                if row['alias_id']:
-                    self.conn.execute(
-                        'UPDATE aliases SET retry_count = retry_count + 1 WHERE id = ?',
-                        (row['alias_id'],)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        if recovered:
+            logger.info('Recovered %s expired alias lease(s)', len(recovered))
+        return recovered
+
+    def recover_stale(self, timeout_seconds):
+        recovery_error = 'Timeout on startup recovery'
+        cutoff_modifier = f'-{max(0, int(timeout_seconds))} seconds'
+        settings = self.get_settings()
+        max_retries = int(settings.get(
+            'max_retries_per_alias',
+            DEFAULT_SETTINGS['max_retries_per_alias'],
+        ))
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                expired = self._recover_expired_alias_leases_locked(
+                    cur, max_retries,
+                )
+                # Let SQLite compare timestamps in UTC. CURRENT_TIMESTAMP is UTC.
+                stale = cur.execute(
+                    '''SELECT r.id, r.alias_id
+                       FROM registrations r
+                       WHERE r.status='pending'
+                         AND julianday(r.created_at) < julianday('now', ?)''',
+                    (cutoff_modifier,),
+                ).fetchall()
+                alias_ids = {row['alias_id'] for row in stale if row['alias_id']}
+                for row in stale:
+                    cur.execute(
+                        '''UPDATE registrations SET status='failed', error_message=?
+                           WHERE id=?''',
+                        (recovery_error, row['id']),
                     )
-                    alias = self.conn.execute(
-                        'SELECT retry_count FROM aliases WHERE id = ?', (row['alias_id'],)
+
+                for alias_id in alias_ids:
+                    alias = cur.execute(
+                        'SELECT account_id, retry_count, status FROM aliases WHERE id=?',
+                        (alias_id,),
                     ).fetchone()
-                    if alias and alias['retry_count'] < max_retries:
-                        self.conn.execute(
-                            "UPDATE aliases SET status='ready' WHERE id=?",
-                            (row['alias_id'],)
+                    if not alias or alias['status'] in ('used', 'failed'):
+                        continue
+                    retry_count = int(alias['retry_count'] or 0) + 1
+                    if retry_count < max_retries:
+                        cur.execute(
+                            '''UPDATE aliases SET status='ready', retry_count=?,
+                               error_reason='', failure_category='', used_at=NULL,
+                               completed_at=NULL, lease_owner='', lease_expires_at=NULL
+                               WHERE id=?''',
+                            (retry_count, alias_id),
                         )
-            self.conn.commit()
-            logger.info(f"Recovered {len(stale)} stale registration(s)")
+                    else:
+                        completed_at = datetime.now().isoformat()
+                        cur.execute(
+                            '''UPDATE aliases SET status='failed', retry_count=?,
+                               error_reason=?, failure_category=?, used_at=NULL,
+                               completed_at=?, lease_owner='', lease_expires_at=NULL
+                               WHERE id=?''',
+                            (
+                                retry_count,
+                                recovery_error,
+                                classify_failure(recovery_error),
+                                completed_at,
+                                alias_id,
+                            ),
+                        )
+                        self._maybe_disable_unusable_account_locked(
+                            cur, alias['account_id'],
+                        )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        total = len(expired) + len(stale)
+        if total:
+            logger.info(
+                'Recovered %s expired lease(s) and %s stale registration(s)',
+                len(expired), len(stale),
+            )
+        return total

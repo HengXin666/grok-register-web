@@ -112,6 +112,7 @@ class OAuthManager:
                 'code': code,
                 'grant_type': 'authorization_code',
                 'redirect_uri': REDIRECT_URI,
+                'scope': SCOPES,
             }
             resp = requests.post(TOKEN_URL, data=data, timeout=30)
             resp.raise_for_status()

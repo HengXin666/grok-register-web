@@ -34,6 +34,17 @@ def init_register_api(db, browser_mgr, email_mgr, socketio):
             data = request.get_json() or {}
             max_rounds = int(data.get('max_rounds', 0))
             max_retries = int(data.get('max_retries', 3))
+            if max_rounds < 0:
+                raise ValueError('max_rounds must be zero or greater')
+            if max_retries < 1:
+                raise ValueError('max_retries must be at least 1')
+            settings = _db.get_settings()
+            concurrency = int(data.get(
+                'concurrency',
+                settings.get('registration_concurrency', 2),
+            ))
+            if concurrency < 1 or concurrency > 10:
+                raise ValueError('concurrency must be between 1 and 10')
         except (ValueError, TypeError) as e:
             _register_lock.release()
             return jsonify({'success': False, 'data': None, 'message': f'Invalid parameter: {e}', 'code': 'INVALID_PARAMS'}), 400
@@ -48,7 +59,11 @@ def init_register_api(db, browser_mgr, email_mgr, socketio):
 
         def _run_and_release():
             try:
-                _engine.run(max_rounds=max_rounds, max_retries=max_retries)
+                _engine.run(
+                    max_rounds=max_rounds,
+                    max_retries=max_retries,
+                    concurrency=concurrency,
+                )
             except Exception as e:
                 logger.error(f"Registration thread error: {e}")
             finally:
@@ -56,7 +71,15 @@ def init_register_api(db, browser_mgr, email_mgr, socketio):
 
         _register_thread = threading.Thread(target=_run_and_release, daemon=True)
         _register_thread.start()
-        return jsonify({'success': True, 'data': {'max_rounds': max_rounds, 'max_retries': max_retries}, 'message': 'Registration started'})
+        return jsonify({
+            'success': True,
+            'data': {
+                'max_rounds': max_rounds,
+                'max_retries': max_retries,
+                'concurrency': concurrency,
+            },
+            'message': 'Registration started',
+        })
 
     @register_bp.route('/api/register/reactivate', methods=['POST'])
     def reactivate():
@@ -141,6 +164,7 @@ def init_register_api(db, browser_mgr, email_mgr, socketio):
                 'status': 'stopped',
                 'current_round': 0,
                 'current_email': '',
+                'active_workers': [],
                 'completed': 0,
                 'success': 0,
                 'failed': 0,

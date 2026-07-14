@@ -38,7 +38,10 @@ export async function render(container) {
                         <label>每别名最大重试次数</label>
                         <input type="number" class="form-input" id="s-alias-retries" value="${s.max_retries_per_alias || 3}" min="1">
                     </div>
-                    <div class="form-group" style="visibility: hidden;"></div>
+                    <div class="form-group">
+                        <label>并发注册 Worker 数</label>
+                        <input type="number" class="form-input" id="s-registration-concurrency" value="${s.registration_concurrency || 2}" min="1" max="10">
+                    </div>
                 </div>
 
                 <hr style="border: 0; border-top: 1px solid var(--border); margin: 20px 0;" />
@@ -78,13 +81,7 @@ export async function render(container) {
                             <label><input type="radio" name="random-name" value="false" ${s.random_name_enabled === 'false' ? 'checked' : ''}> 关闭随机生成</label>
                         </div>
                     </div>
-                    <div class="form-group">
-                        <label>接码邮箱提供商</label>
-                        <div class="radio-group">
-                            <label><input type="radio" name="email-provider" value="hotmail" ${s.email_provider !== 'mail.tm' ? 'checked' : ''}> Hotmail (微软邮箱)</label>
-                            <label><input type="radio" name="email-provider" value="mail.tm" ${s.email_provider === 'mail.tm' ? 'checked' : ''}> Mail.tm (临时邮箱)</label>
-                        </div>
-                    </div>
+                    <div class="form-group" style="visibility: hidden;"></div>
                 </div>
 
                 <div class="form-row">
@@ -199,11 +196,11 @@ function collectSettings() {
         registration_timeout: document.getElementById('s-timeout').value,
         max_confirm_retries: document.getElementById('s-confirm-retries').value,
         max_retries_per_alias: document.getElementById('s-alias-retries').value,
+        registration_concurrency: document.getElementById('s-registration-concurrency').value,
         browser_headless: document.querySelector('input[name="headless"]:checked').value,
         turnstile_auto: document.querySelector('input[name="turnstile"]:checked').value,
         browser_proxy: document.getElementById('s-browser-proxy').value.trim(),
         random_name_enabled: document.querySelector('input[name="random-name"]:checked').value,
-        email_provider: document.querySelector('input[name="email-provider"]:checked').value,
         extract_numbers_enabled: document.querySelector('input[name="extract-numbers"]:checked').value,
         password_mode: document.querySelector('input[name="password-mode"]:checked').value,
         manual_password: document.getElementById('s-manual-password').value,

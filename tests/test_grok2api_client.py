@@ -61,6 +61,29 @@ class Grok2APIClientTest(unittest.TestCase):
         conversion_call = session.post.call_args_list[3]
         self.assertEqual(conversion_call.kwargs['json'], {'ids': ['42']})
 
+    def test_web_sso_conversion_rejects_failed_completion_summary(self):
+        session = Mock()
+        login_one = Mock(status_code=200)
+        login_one.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        imported = Mock(status_code=200, text='event: complete\ndata: {"created":1,"updated":0}\n\n')
+        lookup = Mock(status_code=200)
+        lookup.json.return_value = {
+            'data': {'items': [{'id': '42', 'name': 'user@example.com'}]},
+        }
+        login_two = Mock(status_code=200)
+        login_two.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        converted = Mock(
+            status_code=200,
+            text='event: complete\ndata: {"created":0,"linked":0,"skipped":0,"failed":1}\n\n',
+        )
+        session.post.side_effect = [login_one, imported, login_two, converted]
+        session.get.return_value = lookup
+        client = Grok2APIClient('http://localhost:21434', 'admin', 'secret')
+        client.session = session
+
+        with self.assertRaisesRegex(Grok2APIError, 'failed for Web account 42'):
+            client.import_web_sso_and_convert('sso-token', email='user@example.com')
+
 
 if __name__ == '__main__':
     unittest.main()

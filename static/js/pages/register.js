@@ -94,9 +94,14 @@ export async function render(container) {
 async function startRegistration() {
     const settingsRes = await api('GET', '/api/settings');
     const maxRetries = settingsRes.success ? parseInt(settingsRes.data.max_retries_per_alias) || 3 : 3;
-    const res = await api('POST', '/api/register/start', { max_rounds: 0, max_retries: maxRetries });
+    const concurrency = settingsRes.success ? parseInt(settingsRes.data.registration_concurrency) || 2 : 2;
+    const res = await api('POST', '/api/register/start', {
+        max_rounds: 0,
+        max_retries: maxRetries,
+        concurrency,
+    });
     if (res.success) {
-        showToast('任务已成功启动，正在拉起浏览器...', 'success');
+        showToast(`任务已启动，正在拉起 ${concurrency} 个浏览器 Worker...`, 'success');
         document.getElementById('start-btn').disabled = true;
         document.getElementById('reactivate-btn').disabled = true;
         document.getElementById('pause-btn').disabled = false;
@@ -162,7 +167,10 @@ function updateStatus(data) {
 
     const isReactivate = data.mode === 'reactivate';
     const currentRoundText = data.current_round !== undefined && data.current_round > 0 ? `第 ${data.current_round} 轮` : '等待中';
-    const currentEmailText = data.current_email || '无活跃账号';
+    const activeWorkers = Array.isArray(data.active_workers) ? data.active_workers : [];
+    const currentEmailText = activeWorkers.length
+        ? activeWorkers.map(worker => `${worker.worker_id}: ${worker.email}`).join(' | ')
+        : (data.current_email || '无活跃账号');
     const dashboardTitle = isReactivate ? '旧账号补激活状态仪表盘' : '注册任务状态仪表盘';
     const successLabel = isReactivate ? '补激活成功' : '成功别名';
     const failedLabel = isReactivate ? '补激活失败' : '已失败别名';

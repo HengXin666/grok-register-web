@@ -18,6 +18,18 @@ class BrowserManager:
         self._browser = None
         self._page = None
 
+    def clone(self, worker_id=None):
+        """Create an isolated browser manager for one registration worker."""
+        user_data_path = self.user_data_path
+        if user_data_path and worker_id:
+            user_data_path = f'{user_data_path}-worker-{worker_id}'
+        return BrowserManager(
+            headless=self.headless,
+            extension_path=self.extension_path,
+            user_data_path=user_data_path,
+            proxy=self.proxy,
+        )
+
     def start(self):
         from DrissionPage import Chromium, ChromiumOptions
         logger.info("Starting browser...")

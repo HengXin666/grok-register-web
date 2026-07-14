@@ -5,7 +5,6 @@ import string
 import random
 import secrets
 import re
-from datetime import datetime
 
 from DrissionPage.errors import PageDisconnectedError
 from config import SIGNUP_URL
@@ -21,51 +20,168 @@ def submit_is_in_flight(ui_state):
     return bool(state.get('loading') or state.get('primaryDisabled'))
 
 
+def is_xai_permission_denied(error):
+    text = str(error or '').lower()
+    return 'permission_denied' in text and '403' in text
+
+
+class VerificationRequestError(RuntimeError):
+    """xAI rejected or did not complete the send-code request."""
+
+
 class RegistrationState:
     def __init__(self):
         self._pause_event = threading.Event()
-        self._stop_lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop_flag = False
         self._pause_event.set()
-        self.status = 'stopped'
-        self.current_round = 0
-        self.current_email = ''
-        self.completed = 0
-        self.success = 0
-        self.failed = 0
+        self._status = 'stopped'
+        self._current_round = 0
+        self._legacy_current_email = ''
+        self._completed = 0
+        self._success = 0
+        self._failed = 0
+        self._active_workers = {}
+
+    @property
+    def status(self):
+        with self._lock:
+            return self._status
+
+    @status.setter
+    def status(self, value):
+        with self._lock:
+            self._status = value
+
+    @property
+    def current_round(self):
+        with self._lock:
+            return self._current_round
+
+    @current_round.setter
+    def current_round(self, value):
+        with self._lock:
+            self._current_round = value
+
+    @property
+    def current_email(self):
+        with self._lock:
+            if self._active_workers:
+                return ', '.join(
+                    item['email'] for item in self._active_workers.values()
+                )
+            return self._legacy_current_email
+
+    @current_email.setter
+    def current_email(self, value):
+        with self._lock:
+            self._legacy_current_email = value or ''
+
+    @property
+    def completed(self):
+        with self._lock:
+            return self._completed
+
+    @completed.setter
+    def completed(self, value):
+        with self._lock:
+            self._completed = value
+
+    @property
+    def success(self):
+        with self._lock:
+            return self._success
+
+    @success.setter
+    def success(self, value):
+        with self._lock:
+            self._success = value
+
+    @property
+    def failed(self):
+        with self._lock:
+            return self._failed
+
+    @failed.setter
+    def failed(self, value):
+        with self._lock:
+            self._failed = value
 
     def check_pause(self):
         self._pause_event.wait()
 
     def should_stop(self):
-        with self._stop_lock:
+        with self._lock:
             return self._stop_flag
+
+    def reserve_round(self, max_rounds=0):
+        with self._lock:
+            if max_rounds > 0 and self._current_round >= max_rounds:
+                return None
+            self._current_round += 1
+            return self._current_round
+
+    def set_worker_active(self, worker_id, round_number, alias):
+        with self._lock:
+            self._active_workers[worker_id] = {
+                'worker_id': worker_id,
+                'round': round_number,
+                'email': alias['alias_email'],
+                'account_id': alias['account_id'],
+                'alias_id': alias['id'],
+            }
+            self._legacy_current_email = ''
+
+    def clear_worker(self, worker_id):
+        with self._lock:
+            self._active_workers.pop(worker_id, None)
+
+    def record_success(self):
+        with self._lock:
+            self._success += 1
+            self._completed += 1
+
+    def record_failure(self):
+        with self._lock:
+            self._failed += 1
+            self._completed += 1
 
     def pause(self):
         self._pause_event.clear()
-        self.status = 'paused'
+        with self._lock:
+            self._status = 'paused'
         logger.info("Registration paused")
 
     def resume(self):
         self._pause_event.set()
-        self.status = 'running'
+        with self._lock:
+            self._status = 'running'
         logger.info("Registration resumed")
 
     def stop(self):
-        with self._stop_lock:
+        with self._lock:
             self._stop_flag = True
-        self.status = 'stopped'
+            self._status = 'stopped'
+        self._pause_event.set()
         logger.info("Registration stop requested")
 
     def get_snapshot(self):
-        return {
-            'status': self.status,
-            'current_round': self.current_round,
-            'current_email': self.current_email,
-            'completed': self.completed,
-            'success': self.success,
-            'failed': self.failed,
-        }
+        with self._lock:
+            workers = [
+                dict(item) for _, item in sorted(self._active_workers.items())
+            ]
+            current_email = ', '.join(item['email'] for item in workers)
+            if not current_email:
+                current_email = self._legacy_current_email
+            return {
+                'status': self._status,
+                'current_round': self._current_round,
+                'current_email': current_email,
+                'active_workers': workers,
+                'completed': self._completed,
+                'success': self._success,
+                'failed': self._failed,
+            }
 
 
 class RegistrationEngine:
@@ -76,62 +192,150 @@ class RegistrationEngine:
         self.socketio = socketio
         self.state = state
 
-    def run(self, max_rounds=0, max_retries=3):
+    def run(self, max_rounds=0, max_retries=3, concurrency=1):
         self.state.status = 'running'
-        self.email_mgr.reset_fallback()
         settings = self.db.get_settings()
-        headless = settings.get('browser_headless', 'false') == 'true'
+        concurrency = max(1, min(10, int(concurrency or 1)))
+        batch_id = secrets.token_hex(6)
+        claimed_any = threading.Event()
+        browser_started_any = threading.Event()
+        logger.info(
+            'Registration started (max_rounds=%s, max_retries=%s, concurrency=%s)',
+            max_rounds or 'unlimited', max_retries, concurrency,
+        )
 
-        logger.info(f"Registration started (max_rounds={max_rounds or 'unlimited'}, max_retries={max_retries})")
-
-        # Start browser
+        workers = []
         try:
-            self.browser.headless = headless
-            self.browser.proxy = (settings.get('browser_proxy', '') or '').strip()
-            self.browser.start()
-        except Exception as e:
-            logger.error(f"Failed to start browser: {e}")
-            self._emit_error('BROWSER_START', f'Failed to start browser: {e}', fatal=True)
-            return
-
-        round_num = 0
-        try:
-            while True:
-                if max_rounds > 0 and round_num >= max_rounds:
-                    logger.info(f"Reached max rounds ({max_rounds}), stopping")
-                    break
-                if self.state.should_stop():
-                    logger.info("Stop flag detected, finishing")
-                    break
-
-                self.state.check_pause()
-                round_num += 1
-                self.state.current_round = round_num
-                self._emit_status()
-
-                try:
-                    self._do_one_round(round_num, max_retries, settings)
-                except Exception as e:
-                    logger.error(f"Round {round_num} failed: {e}")
-                    self.state.failed += 1
-                    self.state.completed += 1
-                    # Only restart browser if not stopping
-                    if not self.state.should_stop():
-                        try:
-                            self._restart_browser(force_close=True)
-                        except Exception:
-                            pass
-                    self._emit_status()
-
+            for index in range(concurrency):
+                worker_id = f'worker-{index + 1}'
+                browser = self.browser.clone(worker_id=worker_id)
+                worker_engine = RegistrationEngine(
+                    self.db, browser, self.email_mgr, self.socketio, self.state,
+                )
+                thread = threading.Thread(
+                    target=worker_engine._run_worker,
+                    args=(
+                        worker_id,
+                        f'{batch_id}:{worker_id}',
+                        max_rounds,
+                        max_retries,
+                        settings,
+                        claimed_any,
+                        browser_started_any,
+                    ),
+                    name=f'register-{worker_id}',
+                    daemon=True,
+                )
+                workers.append(thread)
+                thread.start()
+            for thread in workers:
+                thread.join()
         finally:
             self.state.status = 'stopped'
+            self._emit_status()
+            if not browser_started_any.is_set() and not self.state.should_stop():
+                self._emit_error(
+                    'BROWSER_START', 'All registration browsers failed to start',
+                    fatal=True,
+                )
+            elif not claimed_any.is_set() and not self.state.should_stop():
+                self._emit_error('NO_ALIASES', 'No available aliases', fatal=True)
+            snapshot = self.state.get_snapshot()
+            logger.info(
+                'Registration ended. Completed: %s, Success: %s, Failed: %s',
+                snapshot['completed'], snapshot['success'], snapshot['failed'],
+            )
+
+    def _run_worker(self, worker_id, lease_owner, max_rounds, max_retries,
+                    settings, claimed_any, browser_started_any):
+        self.browser.headless = settings.get('browser_headless', 'false') == 'true'
+        self.browser.proxy = (settings.get('browser_proxy', '') or '').strip()
+        lease_seconds = max(
+            120,
+            int(settings.get('registration_timeout', 300) or 300) * 2,
+        )
+        try:
+            self.browser.start()
+        except Exception as exc:
+            logger.error('[%s] Failed to start browser: %s', worker_id, exc)
+            self._emit_error(
+                'BROWSER_START', f'[{worker_id}] Failed to start browser: {exc}',
+                fatal=False,
+            )
+            return
+        browser_started_any.set()
+
+        try:
+            while not self.state.should_stop():
+                self.state.check_pause()
+                if self.state.should_stop():
+                    break
+                alias = self.db.claim_next_alias(
+                    max_retries=max_retries,
+                    lease_owner=lease_owner,
+                    lease_seconds=lease_seconds,
+                )
+                if not alias:
+                    break
+                claimed_any.set()
+
+                round_num = self.state.reserve_round(max_rounds)
+                if round_num is None:
+                    self.db.release_alias_claim(alias['id'], lease_owner)
+                    break
+
+                self.state.set_worker_active(worker_id, round_num, alias)
+                self._emit_status()
+                heartbeat_stop = threading.Event()
+                heartbeat = threading.Thread(
+                    target=self._lease_heartbeat,
+                    args=(
+                        alias['id'], lease_owner, lease_seconds, heartbeat_stop,
+                    ),
+                    name=f'lease-{worker_id}',
+                    daemon=True,
+                )
+                heartbeat.start()
+                try:
+                    try:
+                        self._do_one_round(
+                            alias, round_num, max_retries, settings,
+                            lease_owner, worker_id,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            '[%s] Unexpected worker round failure: %s',
+                            worker_id, exc,
+                        )
+                        self.db.release_alias_claim(alias['id'], lease_owner)
+                        self._emit_error(
+                            'WORKER_ROUND',
+                            f'[{worker_id}] Unexpected worker failure: {exc}',
+                            fatal=False,
+                        )
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat.join(timeout=2)
+                    self.state.clear_worker(worker_id)
+                    self._emit_status()
+        finally:
+            self.state.clear_worker(worker_id)
             try:
                 self.browser.stop()
             except Exception:
                 pass
-            self._emit_status()
-            logger.info(f"Registration ended. Completed: {self.state.completed}, "
-                        f"Success: {self.state.success}, Failed: {self.state.failed}")
+
+    def _lease_heartbeat(self, alias_id, lease_owner, lease_seconds, stop_event):
+        interval = max(5, min(60, lease_seconds // 3))
+        while not stop_event.wait(interval):
+            try:
+                if not self.db.heartbeat_alias_lease(
+                    alias_id, lease_owner, lease_seconds,
+                ):
+                    logger.warning('Alias %s lease was lost', alias_id)
+                    return
+            except Exception as exc:
+                logger.warning('Alias %s lease heartbeat failed: %s', alias_id, exc)
 
     # ── Browser helpers ────────────────────────────────────────
 
@@ -183,27 +387,21 @@ class RegistrationEngine:
 
     # ── Single round ───────────────────────────────────────────
 
-    def _do_one_round(self, round_num, max_retries, settings):
-        alias = self.db.get_next_alias(max_retries)
-        if not alias:
-            logger.error("No available aliases. Please import accounts or reset existing ones.")
-            self._emit_error('NO_ALIASES', 'No available aliases', fatal=True)
-            self.state.stop()
-            return
-
+    def _do_one_round(self, alias, round_num, max_retries, settings,
+                      lease_owner, worker_id):
         alias_email = alias['alias_email']
-        self.state.current_email = alias_email
-        logger.info(f"Round {round_num}: using alias {alias_email}")
-        self._emit_status()
+        logger.info('[%s] Round %s: using alias %s', worker_id, round_num, alias_email)
 
         password = self._get_password(settings)
         reg_id = self.db.create_registration(
             alias_id=alias['id'],
             email=alias_email,
             password=password,
-            round_number=round_num
+            round_number=round_num,
+            lease_owner=lease_owner,
         )
         start_time = time.time()
+        success_committed = False
 
         try:
             # 1. Open signup page
@@ -219,18 +417,12 @@ class RegistrationEngine:
             # 3. Get verification code
             self.state.check_pause()
             logger.info("Requesting verification code...")
-            actual_email, code = self.email_mgr.get_code_with_fallback(
+            code = self.email_mgr.get_code_for_alias(
                 alias_email, alias['account_id'],
                 alias['client_id'], alias['refresh_token'],
                 max_retries=int(settings.get('max_code_retries', 3)),
-                on_fallback_notify=self._notify_mail_tm_switch,
                 main_email=alias.get('main_email')
             )
-            # Update registration email if Mail.tm fallback was used
-            if actual_email != alias_email:
-                logger.info(f"Using fallback email: {actual_email}")
-                self.db.conn.execute('UPDATE registrations SET email=? WHERE id=?', (actual_email, reg_id))
-                self.db.conn.commit()
 
             # 4. Fill code and confirm
             self.state.check_pause()
@@ -271,12 +463,14 @@ class RegistrationEngine:
 
             # 9. Save results — SSO already in hand, mark success first
             duration = time.time() - start_time
-            self.db.update_registration(reg_id, 'success', sso=sso, duration=duration)
-            self.db.update_alias_status(alias['id'], 'used', sso=sso)
+            completion = self.db.complete_registration_success(
+                reg_id, alias['id'], lease_owner, sso, duration=duration,
+            )
+            success_committed = True
 
             try:
                 upload_result = upload_registered_sso(
-                    settings, sso, email=actual_email,
+                    settings, sso, email=alias_email,
                     user_agent=activation.user_agent if activation else '',
                     cloudflare_cookies=activation.cloudflare_cookies if activation else '',
                 )
@@ -296,8 +490,7 @@ class RegistrationEngine:
             except Exception as upload_error:
                 logger.warning(f'grok2api auto upload failed: {upload_error}')
 
-            self.state.success += 1
-            self.state.completed += 1
+            self.state.record_success()
             logger.info(f"Round {round_num} SUCCESS! Duration: {duration:.1f}s")
 
             self.socketio.emit('round_complete', {
@@ -312,25 +505,65 @@ class RegistrationEngine:
             self._restart_browser(force_close=False)
             self._emit_status()
 
-            # Check if account aliases are all used
-            if self.db.check_account_aliases_full(alias['account_id']):
-                self.db.update_account_status(alias['account_id'], 'done')
+            if completion['account_done']:
                 logger.info(f"Account {alias['main_email']} aliases exhausted, marked as done")
 
         except Exception as e:
             duration = time.time() - start_time
             error_msg = str(e)
-            self.db.update_registration(reg_id, 'failed', error=error_msg, duration=duration)
-            self.db.increment_alias_retry(alias['id'])
+            if success_committed:
+                logger.warning(
+                    'Round %s completed successfully but cleanup failed: %s',
+                    round_num, error_msg,
+                )
+                return
+            if isinstance(e, VerificationRequestError) and is_xai_permission_denied(e):
+                released = self.db.abort_registration_attempt(
+                    reg_id=reg_id,
+                    alias_id=alias['id'],
+                    lease_owner=lease_owner,
+                    error=error_msg,
+                    duration=duration,
+                )
+                self.state.record_failure()
+                self.state.stop()
+                logger.error(
+                    'Round %s stopped by xAI permission_denied 403; alias %s '
+                    'was %s without consuming a retry',
+                    round_num,
+                    alias_email,
+                    'released' if released else 'not released (lease lost)',
+                )
+                self._emit_error(
+                    'XAI_PERMISSION_DENIED',
+                    'xAI rejected the verification-code request with HTTP 403. '
+                    'No email was sent; the alias was preserved. Retry later or '
+                    'change the network/IP before restarting registration.',
+                    fatal=True,
+                )
+                self._emit_status()
+                return
+            outcome = self.db.finish_registration_attempt(
+                reg_id=reg_id,
+                alias_id=alias['id'],
+                lease_owner=lease_owner,
+                error=error_msg,
+                duration=duration,
+                max_retries=max_retries,
+            )
             logger.error(f"Round {round_num} FAILED: {error_msg}")
-            # Check if alias has exhausted retries
-            alias_row = self.db.conn.execute('SELECT retry_count FROM aliases WHERE id=?', (alias['id'],)).fetchone()
-            current_retries = alias_row['retry_count'] if alias_row else 0
-            if current_retries >= max_retries:
-                self.db.update_alias_status(alias['id'], 'failed', error=error_msg)
-                self.state.failed += 1
-                self.state.completed += 1
+            current_retries = outcome['retry_count']
+            if outcome['lease_lost']:
+                logger.warning('Alias %s lease was lost before failure commit', alias['id'])
+            elif outcome['terminal']:
+                self.state.record_failure()
                 logger.info(f"Alias {alias_email} exhausted {max_retries} retries, marked failed")
+                if outcome['account_disabled']:
+                    logger.warning(
+                        'Skipped remaining aliases for account %s: %s',
+                        alias.get('main_email') or alias_email,
+                        outcome['disable_reason'],
+                    )
             else:
                 logger.info(f"Alias {alias_email} will retry ({current_retries}/{max_retries})")
             self._emit_status()
@@ -411,6 +644,28 @@ return {challenge, href, hasEmailField, hasEmailSignup, title: document.title};
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
+                # Prefer a real Chromium click. xAI can distinguish DOM
+                # element.click() from trusted pointer input.
+                for element in self.browser.page.eles(
+                    'css:button, [role="button"]'
+                ):
+                    label = str(element.text or '').strip()
+                    normalized = re.sub(r'\s+', ' ', label).lower()
+                    compact = normalized.replace(' ', '')
+                    if any(word in normalized for word in ('google', 'apple', 'cookie')):
+                        continue
+                    if (
+                        '使用邮箱' in label
+                        or compact in ('signupwithemail', 'continuewithemail')
+                        or 'sign up with email' in normalized
+                        or 'continue with email' in normalized
+                    ):
+                        element.click()
+                        logger.info('Clicked email signup button natively: %s', label)
+                        return True
+            except Exception as exc:
+                logger.debug('Native email entry click unavailable: %s', exc)
+            try:
                 # If email field is already visible, no entry button is needed.
                 already = self.browser.run_js(r"""
 return !!document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
@@ -464,10 +719,60 @@ return {clicked: true, label: (target.innerText || target.textContent || '').rep
         raise Exception('未找到邮箱注册入口按钮（支持：使用邮箱注册 / Sign up with email）')
 
     def _fill_email(self, email_addr, timeout=15):
-        """Fill email using JS (React-compatible)."""
-        logger.info(f"Filling email via JS: {email_addr}")
+        """Fill and submit the email form, preferring trusted browser input."""
+        logger.info(f"Filling email: {email_addr}")
         deadline = time.time() + timeout
         while time.time() < deadline:
+            try:
+                # Real keyboard and pointer events are preferred over synthetic
+                # JS events because xAI uses browser-behavior signals when it
+                # authorizes the verification-code request.
+                email_input = self.browser.page.ele(
+                    'css:input[data-testid="email"], input[name="email"], '
+                    'input[type="email"], input[autocomplete="email"]',
+                    timeout=2,
+                )
+                if email_input:
+                    email_input.click()
+                    email_input.input(email_addr, clear=True, by_js=False)
+                    time.sleep(random.uniform(0.7, 1.3))
+                    candidates = self.browser.page.eles(
+                        'css:button[type="submit"], button'
+                    )
+                    submit = None
+                    for element in candidates:
+                        label = str(element.text or '').strip()
+                        normalized = re.sub(r'\s+', ' ', label).lower()
+                        compact = normalized.replace(' ', '')
+                        if any(word in normalized for word in ('google', 'apple', 'cookie')):
+                            continue
+                        if (
+                            compact in ('signup', 'sign-up', 'continue', 'next', 'submit', '注册')
+                            or normalized in ('sign up', 'sign-up')
+                        ):
+                            submit = element
+                            break
+                    if submit is None:
+                        submit = next(
+                            (
+                                element for element in candidates
+                                if str(element.attr('type') or '').lower() == 'submit'
+                            ),
+                            None,
+                        )
+                    if submit:
+                        submit.click()
+                        logger.info(
+                            'Filled email and clicked submit natively (%s): %s',
+                            str(submit.text or '').strip() or 'submit',
+                            email_addr,
+                        )
+                        self._wait_for_verification_request(email_addr)
+                        return
+            except VerificationRequestError:
+                raise
+            except Exception as exc:
+                logger.debug('Native email form interaction unavailable: %s', exc)
             try:
                 filled = self.browser.run_js(
                     """
@@ -506,6 +811,14 @@ return 'filled';
 
                 if filled == 'filled':
                     time.sleep(0.8)
+                    email_turnstile = self.browser.run_js(r"""
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+if (!input) return 'not-found';
+return String(input.value || '').trim().length >= 50 ? 'ready' : 'pending';
+                    """)
+                    if email_turnstile == 'pending':
+                        logger.info('Turnstile pending before email submission, solving...')
+                        self._solve_turnstile()
                     # Click submit/register button
                     clicked = self.browser.run_js(r"""
 function isVisible(node) {
@@ -564,18 +877,93 @@ return {ok:true, label:(submitButton.innerText || submitButton.textContent || ''
                             clicked.get('label') or 'submit',
                             email_addr,
                         )
+                        self._wait_for_verification_request(email_addr)
                         return
                     if isinstance(clicked, dict) and clicked.get('labels'):
                         logger.debug('Email submit candidates: %s', clicked.get('labels'))
                     elif clicked is True:
                         logger.info(f"Filled email and clicked submit: {email_addr}")
+                        self._wait_for_verification_request(email_addr)
                         return
 
+            except VerificationRequestError:
+                raise
             except Exception:
                 pass
             time.sleep(0.5)
 
         raise Exception("Failed to fill email or find submit button")
+
+    def _wait_for_verification_request(self, email_addr, timeout=20):
+        """Wait until xAI accepts the send-code request or exposes its error."""
+        deadline = time.time() + timeout
+        last_state = {}
+        while time.time() < deadline:
+            state = self.browser.run_js(r"""
+function visible(node) {
+  if (!node) return false;
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden'
+    && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+}
+const codeInput = Array.from(document.querySelectorAll('input')).find((node) => {
+  if (!visible(node) || node.disabled || node.readOnly) return false;
+  const meta = [
+    node.name, node.id, node.autocomplete, node.placeholder,
+    node.getAttribute('data-testid'), node.getAttribute('aria-label')
+  ].join(' ').toLowerCase();
+  const maxLength = Number(node.maxLength || 0);
+  return meta.includes('code') || meta.includes('otp')
+    || meta.includes('verification') || meta.includes('one-time')
+    || maxLength === 6;
+});
+const emailInput = Array.from(document.querySelectorAll(
+  'input[type="email"], input[name="email"], input[autocomplete="email"]'
+)).find(visible);
+const alerts = Array.from(document.querySelectorAll(
+  '[role="alert"], [aria-live="assertive"], [data-testid*="error"], .error, .text-error, .text-red-500'
+)).filter(visible).map(node => String(node.innerText || node.textContent || '').trim());
+const body = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+const lower = body.toLowerCase();
+let error = alerts.filter(Boolean).join(' | ');
+if (!error && (
+  lower.includes('permission_denied') || lower.includes('http 403')
+  || lower.includes('permission denied') || lower.includes('access denied')
+  || lower.includes('too many requests') || lower.includes('try again later')
+)) {
+  const marker = lower.search(/permission_denied|http 403|permission denied|access denied|too many requests|try again later/);
+  error = body.slice(Math.max(0, marker - 100), marker + 240);
+}
+const readyText = lower.includes('check your email')
+  || lower.includes('enter the code') || lower.includes('verification code')
+  || lower.includes('confirmation code') || lower.includes('验证码');
+return {
+  ready: !!codeInput || (readyText && !emailInput),
+  error,
+  href: location.href,
+  title: document.title,
+  emailVisible: !!emailInput,
+  body: body.slice(0, 500),
+};
+            """) or {}
+            last_state = state if isinstance(state, dict) else {}
+            error = str(last_state.get('error') or '').strip()
+            if error:
+                raise VerificationRequestError(
+                    f'xAI verification-code request rejected for {email_addr}: '
+                    f'{error[:300]}'
+                )
+            if last_state.get('ready'):
+                logger.info('xAI accepted verification-code request for %s', email_addr)
+                return
+            time.sleep(0.5)
+
+        raise VerificationRequestError(
+            'xAI verification-code request did not reach the code-entry page: '
+            f'url={last_state.get("href", "")} '
+            f'body={str(last_state.get("body") or "")[:240]}'
+        )
 
     def _fill_and_confirm_code(self, code, timeout=180):
         """Fill verification code and confirm, with multiple retry strategies."""
@@ -1677,13 +2065,6 @@ return matches.slice(0, 30);
                       'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Perez', 'Thompson',
                       'White', 'Harris', 'Sanchez', 'Clark', 'Ramirez', 'Lewis', 'Robinson']
         return random.choice(first_names), random.choice(last_names)
-
-    def _notify_mail_tm_switch(self):
-        self.socketio.emit('log', {
-            'level': 'warning',
-            'message': 'Switched to Mail.tm fallback mode (this round only)',
-            'timestamp': datetime.now().isoformat(),
-        })
 
     def _emit_status(self):
         self.socketio.emit('status_update', self.state.get_snapshot())

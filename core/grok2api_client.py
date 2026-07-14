@@ -280,6 +280,10 @@ class Grok2APIClient:
             '/api/admin/v1/accounts/web/convert-to-build',
             json_body={'ids': [str(account['id'])]},
         )
+        if int(converted.get('failed', 0) or 0) > 0:
+            raise Grok2APIError(
+                f'grok2api Build conversion failed for Web account {account["id"]}'
+            )
         return {'import': imported, 'conversion': converted}
 
     def upsert_web_egress_context(self, user_agent, cloudflare_cookies):

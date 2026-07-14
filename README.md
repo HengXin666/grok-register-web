@@ -153,6 +153,8 @@ python -m unittest discover -s tests -v
 - 需要本机已安装 Chrome / Chromium  
 - 账号、Token、密码仅存本地 `data/`，请勿把运行时数据提交到公开仓库  
 - Cloudflare 托管挑战无法保证全自动，请用「推荐用法」分流  
+- 注册页出现 `[permission_denied] HTTP 403` 表示 xAI 拒绝了发送验证码请求，邮箱中不会产生新邮件。程序会立即停止并保留 alias/retry 预算；请等待风控解除或更换网络出口后再启动
+- 邮箱 Token 会自动识别 Microsoft Graph 与旧 Outlook REST 授权范围；无读取权限时会直接显示 OAuth/API 错误，不会切换到无关临时邮箱
 
 ## 致谢
 

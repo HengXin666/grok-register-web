@@ -1,12 +1,11 @@
-import imaplib
-import email
-import re
 import logging
+import re
 import time
 
 import requests
 
-from config import TOKEN_URL
+from config import SCOPES, TOKEN_URL
+
 
 logger = logging.getLogger('register')
 
@@ -15,23 +14,29 @@ class EmailError(Exception):
     pass
 
 
+class EmailPermissionError(EmailError):
+    """The mailbox token cannot read mail and retrying will not help."""
+
+
 class EmailManager:
     def __init__(self, db):
         self.db = db
-        self._mail_tm_fallback = False
-        self._imap_fail_count = 0
-
-    def reset_fallback(self):
-        self._mail_tm_fallback = False
-        self._imap_fail_count = 0
 
     def refresh_token(self, account_id, client_id, old_refresh_token):
-        """Refresh OAuth2 token, trying two endpoints like original script."""
+        """Refresh a mail token and match it to its authorized API audience."""
         endpoints = [
+            # Legacy imported tokens commonly issue opaque Outlook REST tokens
+            # only when no scope override is supplied.
             (TOKEN_URL, {}),
-            ('https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
-             {'scope': 'offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read'}),
+            ('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {}),
+            # Newly authorized accounts use Microsoft Graph Mail.Read.
+            (
+                'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
+                {'scope': SCOPES},
+            ),
+            (TOKEN_URL, {'scope': SCOPES}),
         ]
+        errors = []
         for url, extra in endpoints:
             try:
                 data = {
@@ -40,247 +45,345 @@ class EmailManager:
                     'grant_type': 'refresh_token',
                     **extra,
                 }
-                resp = requests.post(url, data=data, timeout=30)
-                token_data = resp.json()
-                logger.info(f"Token endpoint: status={resp.status_code}, has_access_token={bool(token_data.get('access_token'))}, error={token_data.get('error', 'none')}")
-                if token_data.get('access_token'):
+                response = requests.post(url, data=data, timeout=30)
+                try:
+                    token_data = response.json()
+                except ValueError:
+                    token_data = {}
+                logger.info(
+                    'Token endpoint: status=%s, has_access_token=%s, error=%s',
+                    response.status_code,
+                    bool(token_data.get('access_token')),
+                    token_data.get('error', 'none'),
+                )
+                access_token = token_data.get('access_token')
+                if access_token:
                     new_token = token_data.get('refresh_token', old_refresh_token)
                     self.db.update_refresh_token(account_id, new_token)
-                    logger.info(f"Token refreshed OK, token_len={len(token_data['access_token'])}")
-                    return new_token, token_data['access_token']
-                else:
-                    logger.warning(f"No access_token: {token_data.get('error_description', '')[:100]}")
-            except Exception as e:
-                logger.warning(f"Token endpoint failed: {e}")
-                continue
-        raise EmailError('Token refresh failed on all endpoints')
+                    old_refresh_token = new_token
+                    mail_api, probe_error = self._detect_mail_api(access_token)
+                    if mail_api:
+                        logger.info(
+                            'Mailbox token refreshed OK: api=%s, token_len=%s',
+                            mail_api,
+                            len(access_token),
+                        )
+                        return new_token, access_token, mail_api
+                    errors.append(probe_error)
+                    continue
 
-    def get_verification_code(self, email_addr, client_id, refresh_token, max_retries=3, account_id=None, main_email=None):
-        # Refresh token once before all attempts (like original)
-        new_refresh, access_token = self.refresh_token(account_id or 0, client_id, refresh_token)
-        if new_refresh:
-            refresh_token = new_refresh
+                description = str(
+                    token_data.get('error_description')
+                    or token_data.get('error')
+                    or response.text
+                    or 'no access token'
+                ).strip()
+                errors.append(f'HTTP {response.status_code}: {description[:160]}')
+            except Exception as exc:
+                errors.append(str(exc)[:160])
+                logger.warning('Token endpoint failed: %s', exc)
 
-        # OAuth2 token is bound to the main mailbox; plus-address aliases land there too.
-        mailbox_email = main_email or email_addr
+        detail = ' | '.join(errors)
+        raise EmailPermissionError(
+            f'Microsoft mailbox token refresh failed or access check failed'
+            f'{f": {detail}" if detail else ""}'
+        )
+
+    def get_verification_code(self, email_addr, client_id, refresh_token,
+                              max_retries=3, account_id=None, main_email=None):
+        """Poll the token's mail API for the verification mail sent to an alias."""
+        # The OAuth token belongs to the main mailbox; plus-address aliases are
+        # delivered to that same mailbox, so no provider/address switch is needed.
+        _, access_token, mail_api = self.refresh_token(
+            account_id or 0, client_id, refresh_token,
+        )
 
         # Give xAI a moment to deliver the email before the first poll.
         time.sleep(8)
 
+        last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"Fetching verification code... (attempt {attempt}/{max_retries})")
-                # Prefer Outlook REST: consumer MSA tokens often auth IMAP then fail with
-                # "User is authenticated but not connected".
-                code = self._rest_get_code(access_token)
+                logger.info(
+                    'Fetching verification code for %s via %s... (attempt %s/%s)',
+                    email_addr,
+                    mail_api,
+                    attempt,
+                    max_retries,
+                )
+                if mail_api == 'graph':
+                    code = self._graph_get_code(access_token)
+                else:
+                    code = self._outlook_get_code(access_token)
                 if code:
-                    logger.info(f"Verification code obtained (REST): {code}")
+                    logger.info(
+                        'Verification code obtained (%s): %s',
+                        mail_api,
+                        code,
+                    )
                     return code
-            except Exception as e:
-                logger.warning(f"REST mail attempt {attempt} failed: {e}")
-                try:
-                    code = self._imap_get_code(mailbox_email, access_token)
-                    if code:
-                        logger.info(f"Verification code obtained (IMAP): {code}")
-                        return code
-                except Exception as e2:
-                    logger.warning(f"IMAP attempt {attempt} failed: {e2}")
+            except EmailPermissionError:
+                # Repeating the same request or switching aliases cannot make
+                # an unreadable token gain mail access.
+                raise
+            except EmailError as exc:
+                last_error = exc
+                logger.warning('%s mail attempt %s failed: %s', mail_api, attempt, exc)
 
             if attempt < max_retries:
                 time.sleep(5)
 
-        raise EmailError(f"Failed to get verification code after {max_retries} attempts")
+        if last_error:
+            raise EmailError(
+                f'Failed to get verification code after {max_retries} attempts; '
+                f'last mail error: {last_error}'
+            )
+        raise EmailError(
+            f'Failed to get verification code after {max_retries} attempts'
+        )
 
-    def _rest_get_code(self, access_token):
-        """Fetch verification code via Outlook REST API (works with MSA OAuth tokens)."""
-        from datetime import datetime, timezone, timedelta
-        import html as _html
+    def _detect_mail_api(self, access_token):
+        """Return the mail API authorized for an imported access token."""
+        probes = (
+            (
+                'graph',
+                'https://graph.microsoft.com/v1.0/me/messages?$top=1&$select=id',
+            ),
+            (
+                'outlook',
+                'https://outlook.office.com/api/v2.0/me/messages?$top=1&$select=Id',
+            ),
+        )
+        errors = []
+        for name, url in probes:
+            try:
+                response = requests.get(
+                    url,
+                    headers={
+                        'Authorization': f'Bearer {access_token}',
+                        'Accept': 'application/json',
+                    },
+                    timeout=30,
+                )
+            except Exception as exc:
+                errors.append(f'{name} probe: {exc}')
+                continue
+            if response.status_code == 200:
+                return name, ''
+            code, message = self._mail_api_error(response)
+            detail = ': '.join(part for part in (code, message) if part)
+            errors.append(
+                f'{name} probe HTTP {response.status_code}'
+                f'{f" ({detail})" if detail else ""}'
+            )
+        return None, '; '.join(errors)
 
-        logger.info(f"REST _rest_get_code: token_len={len(access_token)}")
+    def _graph_get_code(self, access_token):
+        """Fetch recent verification messages through Microsoft Graph."""
+        from datetime import datetime, timedelta, timezone
+        import html as html_module
+
+        logger.info('Graph _graph_get_code: token_len=%s', len(access_token))
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
         url = (
-            "https://outlook.office.com/api/v2.0/me/messages"
-            "?$top=15"
-            "&$select=Subject,From,ReceivedDateTime,BodyPreview,Body"
-            "&$orderby=ReceivedDateTime desc"
+            'https://graph.microsoft.com/v1.0/me/messages'
+            '?$top=25'
+            '&$select=subject,from,receivedDateTime,bodyPreview,body'
+            '&$orderby=receivedDateTime desc'
         )
-        resp = requests.get(
+        response = requests.get(
             url,
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers={
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/json',
+            },
             timeout=30,
         )
-        if resp.status_code != 200:
-            raise EmailError(f"Outlook REST mail failed: HTTP {resp.status_code} {resp.text[:200]}")
+        if response.status_code != 200:
+            code, message = self._mail_api_error(response)
+            detail = ': '.join(part for part in (code, message) if part)
+            error = (
+                f'Microsoft Graph mail failed: HTTP {response.status_code}'
+                f'{f" ({detail})" if detail else ""}'
+            )
+            if response.status_code in (401, 403):
+                raise EmailPermissionError(error)
+            raise EmailError(error)
 
-        keywords = ["x.ai", "xai", "grok", "verification", "code", "confirm", "confirmation"]
-        messages = resp.json().get("value", [])
-        for msg in messages:
-            received = msg.get("ReceivedDateTime") or ""
+        try:
+            messages = response.json().get('value', [])
+        except (AttributeError, ValueError) as exc:
+            raise EmailError(f'Microsoft Graph returned invalid JSON: {exc}') from exc
+
+        keywords = (
+            'x.ai', 'xai', 'grok', 'verification',
+            'code', 'confirm', 'confirmation',
+        )
+        for message in messages:
+            received = message.get('receivedDateTime') or ''
             try:
-                # e.g. 2026-07-14T02:10:57Z
-                dt = datetime.fromisoformat(received.replace("Z", "+00:00"))
-                if dt < cutoff:
+                received_at = datetime.fromisoformat(
+                    received.replace('Z', '+00:00')
+                )
+                if received_at < cutoff:
                     continue
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
-            subject = msg.get("Subject") or ""
-            from_obj = msg.get("From") or {}
-            sender = ""
-            if isinstance(from_obj, dict):
-                ea = from_obj.get("EmailAddress") or {}
-                sender = f"{ea.get('Name', '')} {ea.get('Address', '')}"
-            preview = msg.get("BodyPreview") or ""
-            body_obj = msg.get("Body") or {}
-            raw_body = body_obj.get("Content") or ""
-            if (body_obj.get("ContentType") or "").upper() == "HTML":
-                body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", _html.unescape(raw_body))).strip()
+            subject = message.get('subject') or ''
+            sender_data = message.get('from') or {}
+            email_address = (
+                sender_data.get('emailAddress') or {}
+                if isinstance(sender_data, dict) else {}
+            )
+            sender = (
+                f"{email_address.get('name', '')} "
+                f"{email_address.get('address', '')}"
+            )
+            preview = message.get('bodyPreview') or ''
+            body_data = message.get('body') or {}
+            if not isinstance(body_data, dict):
+                body_data = {}
+            raw_body = body_data.get('content') or ''
+            if (body_data.get('contentType') or '').upper() == 'HTML':
+                body = re.sub(
+                    r'\s+',
+                    ' ',
+                    re.sub(
+                        r'<[^>]+>',
+                        ' ',
+                        html_module.unescape(raw_body),
+                    ),
+                ).strip()
             else:
                 body = raw_body
 
-            combined = f"{subject} {sender} {preview} {body}".lower()
-            if not any(kw in combined for kw in keywords):
+            combined = f'{subject} {sender} {preview} {body}'.lower()
+            if not any(keyword in combined for keyword in keywords):
                 continue
 
-            code = self._extract_code_from_email(f"{subject}\n{preview}\n{body}")
+            code = self._extract_code_from_email(
+                f'{subject}\n{preview}\n{body}'
+            )
             if code:
                 return code
 
-        logger.debug("No verification code found via Outlook REST")
+        logger.debug('No verification code found via Microsoft Graph')
         return None
 
-    def _imap_get_code(self, email_addr, access_token):
-        """Fetch verification code from IMAP, matching original script's approach."""
-        from email.utils import parsedate_to_datetime
-        from datetime import datetime, timezone
+    def _outlook_get_code(self, access_token):
+        """Fetch mail for legacy opaque tokens authorized for Outlook REST."""
+        from datetime import datetime, timedelta, timezone
+        import html as html_module
 
-        logger.info(f"IMAP _imap_get_code: email={email_addr}, token_len={len(access_token)}")
-        imap = self._imap_connect(email_addr, access_token)
-
-        # Only consider emails from the last 5 minutes (like original's filter_after_ts)
-        filter_after_ts = int((time.time() - 300) * 1000)
+        logger.info('Outlook _outlook_get_code: token_len=%s', len(access_token))
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        url = (
+            'https://outlook.office.com/api/v2.0/me/messages'
+            '?$top=25'
+            '&$select=Subject,From,ReceivedDateTime,BodyPreview,Body'
+            '&$orderby=ReceivedDateTime desc'
+        )
+        response = requests.get(
+            url,
+            headers={
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/json',
+            },
+            timeout=30,
+        )
+        if response.status_code != 200:
+            code, message = self._mail_api_error(response)
+            detail = ': '.join(part for part in (code, message) if part)
+            error = (
+                f'Outlook REST mail failed: HTTP {response.status_code}'
+                f'{f" ({detail})" if detail else ""}'
+            )
+            if response.status_code in (401, 403):
+                raise EmailPermissionError(error)
+            raise EmailError(error)
 
         try:
-            imap.select('INBOX')
-            # Search ALL messages (like original), not just from specific sender
-            status, data = imap.search(None, 'ALL')
-            if status != 'OK' or not data or not data[0]:
-                logger.debug("No emails found in inbox")
-                return None
+            messages = response.json().get('value', [])
+        except (AttributeError, ValueError) as exc:
+            raise EmailError(f'Outlook REST returned invalid JSON: {exc}') from exc
 
-            msg_ids = data[0].split()[-10:]  # Last 10 messages (like original)
-            keywords = ['x.ai', 'xai', 'grok', 'verification', 'code', 'confirm']
-
-            for mid in reversed(msg_ids):  # Newest first
-                _, msg_data = imap.fetch(mid, '(RFC822)')
-                if not msg_data or not msg_data[0]:
-                    continue
-                raw_bytes = msg_data[0][1]
-                if not isinstance(raw_bytes, bytes):
-                    continue
-
-                msg = email.message_from_bytes(raw_bytes)
-
-                # Time filter: skip emails older than 5 minutes (like original)
-                date_str = msg.get('Date')
-                if date_str:
-                    try:
-                        dt = parsedate_to_datetime(date_str)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        msg_ts = int(dt.timestamp() * 1000)
-                        if msg_ts < filter_after_ts:
-                            continue
-                    except Exception:
-                        pass
-
-                subject = msg.get('Subject', '')
-                sender = msg.get('From', '')
-
-                # Extract body
-                body = ''
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if ct == 'text/plain':
-                            body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            break
-                        elif ct == 'text/html':
-                            html_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            import re as _re
-                            import html as _html
-                            body = _re.sub(r'\s+', ' ', _re.sub(r'<[^>]+>', ' ', _html.unescape(html_body))).strip()
-                else:
-                    body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-
-                # Check keywords (like original)
-                combined = f"{subject} {sender} {body}".lower()
-                if not any(kw in combined for kw in keywords):
-                    continue
-
-                code = self._extract_code_from_email(f"{subject}\n{body}")
-                if code:
-                    return code
-
-            # Fallback: try all messages without keyword filter (still time-filtered)
-            for mid in reversed(msg_ids):
-                _, msg_data = imap.fetch(mid, '(RFC822)')
-                if not msg_data or not msg_data[0]:
-                    continue
-                raw_bytes = msg_data[0][1]
-                if not isinstance(raw_bytes, bytes):
-                    continue
-                msg = email.message_from_bytes(raw_bytes)
-
-                # Time filter
-                date_str = msg.get('Date')
-                if date_str:
-                    try:
-                        dt = parsedate_to_datetime(date_str)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        msg_ts = int(dt.timestamp() * 1000)
-                        if msg_ts < filter_after_ts:
-                            continue
-                    except Exception:
-                        pass
-
-                subject = msg.get('Subject', '')
-                body = ''
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == 'text/plain':
-                            body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            break
-                else:
-                    body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                code = self._extract_code_from_email(f"{subject}\n{body}")
-                if code:
-                    return code
-
-            logger.debug("No verification code found in recent emails")
-            return None
-        finally:
+        keywords = (
+            'x.ai', 'xai', 'grok', 'verification',
+            'code', 'confirm', 'confirmation',
+        )
+        for message in messages:
+            received = message.get('ReceivedDateTime') or ''
             try:
-                imap.close()
-                imap.logout()
-            except Exception:
+                received_at = datetime.fromisoformat(
+                    received.replace('Z', '+00:00')
+                )
+                if received_at < cutoff:
+                    continue
+            except (TypeError, ValueError):
                 pass
 
-    def _imap_connect(self, email_addr, access_token):
-        logger.info(f"IMAP connect: {email_addr}, token_len={len(access_token)}")
-        imap = imaplib.IMAP4_SSL('outlook.office365.com', 993, timeout=45)
-        auth_string = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01"
-        imap.authenticate('XOAUTH2', lambda x: auth_string.encode())
-        logger.info("IMAP authenticated successfully")
-        return imap
+            subject = message.get('Subject') or ''
+            sender_data = message.get('From') or {}
+            email_address = (
+                sender_data.get('EmailAddress') or {}
+                if isinstance(sender_data, dict) else {}
+            )
+            sender = (
+                f"{email_address.get('Name', '')} "
+                f"{email_address.get('Address', '')}"
+            )
+            preview = message.get('BodyPreview') or ''
+            body_data = message.get('Body') or {}
+            if not isinstance(body_data, dict):
+                body_data = {}
+            raw_body = body_data.get('Content') or ''
+            if (body_data.get('ContentType') or '').upper() == 'HTML':
+                body = re.sub(
+                    r'\s+',
+                    ' ',
+                    re.sub(
+                        r'<[^>]+>',
+                        ' ',
+                        html_module.unescape(raw_body),
+                    ),
+                ).strip()
+            else:
+                body = raw_body
+
+            combined = f'{subject} {sender} {preview} {body}'.lower()
+            if not any(keyword in combined for keyword in keywords):
+                continue
+            code = self._extract_code_from_email(
+                f'{subject}\n{preview}\n{body}'
+            )
+            if code:
+                return code
+
+        logger.debug('No verification code found via Outlook REST')
+        return None
+
+    @staticmethod
+    def _mail_api_error(response):
+        try:
+            error = response.json().get('error') or {}
+        except (AttributeError, ValueError):
+            error = {}
+        code = str(error.get('code') or '').strip()
+        message = str(error.get('message') or '').strip()
+        if not code and not message:
+            message = str(getattr(response, 'text', '') or '')[:200].strip()
+        return code, message
 
     def _extract_code_from_email(self, body):
-        """Extract verification code, matching original script's patterns."""
-        # Try XXX-XXX format first (like original)
-        m = re.search(r'\b([A-Z0-9]{3}-[A-Z0-9]{3})\b.*confirmation\s*code', body or '', re.IGNORECASE)
-        if m:
-            return m.group(1).upper().replace('-', '')
+        """Extract the xAI verification code from a message body."""
+        match = re.search(
+            r'\b([A-Z0-9]{3}-[A-Z0-9]{3})\b.*confirmation\s*code',
+            body or '',
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper().replace('-', '')
 
         patterns = [
             r'code\s+below\s+to\s+validate.*?\n\s*([A-Z0-9]{3}-[A-Z0-9]{3})\s*\n',
@@ -298,81 +401,18 @@ class EmailManager:
                 return code.upper().replace('-', '') if '-' in code else code.upper()
         return None
 
-    # ── Mail.tm fallback ───────────────────────────────────────
+    def get_code_for_alias(self, alias_email, account_id, client_id,
+                           refresh_token, max_retries=3, main_email=None):
+        """Fetch the code for the mailbox address already submitted to xAI.
 
-    def _mail_tm_get_email_and_token(self):
-        try:
-            domains_resp = requests.get('https://api.mail.tm/domains', timeout=15)
-            domains_resp.raise_for_status()
-            domains = domains_resp.json().get('hydra:member', [])
-            if not domains:
-                raise EmailError("No Mail.tm domains available")
-            domain = domains[0]['domain']
-
-            import random, string
-            addr = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12)) + f'@{domain}'
-            password = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-
-            create_resp = requests.post('https://api.mail.tm/accounts', json={
-                'address': addr,
-                'password': password,
-            }, timeout=15)
-            create_resp.raise_for_status()
-
-            token_resp = requests.post('https://api.mail.tm/token', json={
-                'address': addr,
-                'password': password,
-            }, timeout=15)
-            token_resp.raise_for_status()
-            token = token_resp.json()['token']
-
-            logger.info(f"Mail.tm fallback: created {addr}")
-            return addr, token
-        except Exception as e:
-            raise EmailError(f"Mail.tm fallback failed: {e}")
-
-    def _mail_tm_get_code(self, mail_tm_email, mail_tm_token, max_retries=3):
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = requests.get(
-                    'https://api.mail.tm/messages',
-                    headers={'Authorization': f'Bearer {mail_tm_token}'},
-                    timeout=15
-                )
-                resp.raise_for_status()
-                messages = resp.json().get('hydra:member', [])
-                for msg in messages:
-                    body = msg.get('text', '') or msg.get('html', [''])[0] if msg.get('html') else msg.get('text', '')
-                    code = self._extract_code_from_email(str(body))
-                    if code:
-                        return code
-            except Exception as e:
-                logger.warning(f"Mail.tm attempt {attempt} failed: {e}")
-            if attempt < max_retries:
-                time.sleep(5)
-        raise EmailError("Mail.tm: failed to get verification code")
-
-    # ── Fallback orchestration ─────────────────────────────────
-
-    def get_code_with_fallback(self, alias_email, account_id, client_id, refresh_token,
-                                max_retries=3, on_fallback_notify=None, main_email=None):
-        if self._mail_tm_fallback:
-            logger.info("Using Mail.tm (fallback active this round)")
-            mtm_email, mtm_token = self._mail_tm_get_email_and_token()
-            return mtm_email, self._mail_tm_get_code(mtm_email, mtm_token, max_retries)
-
-        try:
-            code = self.get_verification_code(alias_email, client_id, refresh_token, max_retries,
-                                              account_id=account_id, main_email=main_email)
-            self._imap_fail_count = 0
-            return alias_email, code
-        except EmailError:
-            self._imap_fail_count += 1
-            if self._imap_fail_count >= 3:
-                logger.warning("IMAP failed 3 times, switching to Mail.tm for this round")
-                self._mail_tm_fallback = True
-                if on_fallback_notify:
-                    on_fallback_notify()
-                mtm_email, mtm_token = self._mail_tm_get_email_and_token()
-                return mtm_email, self._mail_tm_get_code(mtm_email, mtm_token, max_retries)
-            raise
+        After the signup form has been filled with ``alias_email``, switching
+        to another provider cannot receive the code and only burns rate limits.
+        """
+        return self.get_verification_code(
+            alias_email,
+            client_id,
+            refresh_token,
+            max_retries,
+            account_id=account_id,
+            main_email=main_email,
+        )
