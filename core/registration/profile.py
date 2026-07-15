@@ -63,7 +63,8 @@ def classify_profile_submit(snapshot, *, left_signup=False, has_sso=False,
     return ProfileSubmitStage.SUBMITTED
 
 
-def save_profile_diagnostics(page, stage, snapshot=None, reason='', directory=None):
+def save_profile_diagnostics(page, stage, snapshot=None, reason='', directory=None,
+                             details=None, pages=None):
     """Persist a compact state snapshot and best-effort screenshot."""
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     directory = directory or os.path.join(project_root, 'data', 'diagnostics')
@@ -72,12 +73,12 @@ def save_profile_diagnostics(page, stage, snapshot=None, reason='', directory=No
     stage_value = stage.value if isinstance(stage, ProfileSubmitStage) else str(stage)
     base_name = f'profile-{timestamp}-{stage_value}'
     json_path = os.path.join(directory, f'{base_name}.json')
-    png_path = os.path.join(directory, f'{base_name}.png')
 
     payload = {
         'stage': stage_value,
         'reason': str(reason or ''),
         'snapshot': asdict(snapshot or ProfileSubmitSnapshot()),
+        'details': details or {},
     }
     try:
         payload['page_title'] = str(getattr(page, 'title', '') or '')
@@ -88,22 +89,41 @@ def save_profile_diagnostics(page, stage, snapshot=None, reason='', directory=No
     except Exception:
         payload['page_url'] = ''
 
+    capture_pages = list(pages or [])
+    if not capture_pages and page is not None:
+        capture_pages = [page]
+
+    screenshot_paths = []
+    for index, capture_page in enumerate(capture_pages, start=1):
+        screenshot_name = (
+            f'{base_name}.png'
+            if len(capture_pages) == 1
+            else f'{base_name}-tab-{index}.png'
+        )
+        expected_path = os.path.join(directory, screenshot_name)
+        try:
+            result = capture_page.get_screenshot(
+                path=directory, name=screenshot_name, full_page=True,
+            )
+            screenshot_paths.append(str(result or expected_path))
+        except TypeError:
+            try:
+                result = capture_page.get_screenshot(
+                    path=directory, name=screenshot_name,
+                )
+                screenshot_paths.append(str(result or expected_path))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    screenshot_path = screenshot_paths[0] if screenshot_paths else ''
+    payload['screenshots'] = screenshot_paths
     with open(json_path, 'w', encoding='utf-8') as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
-    screenshot_path = ''
-    try:
-        result = page.get_screenshot(
-            path=directory, name=f'{base_name}.png', full_page=True,
-        )
-        screenshot_path = str(result or png_path)
-    except TypeError:
-        try:
-            result = page.get_screenshot(path=directory, name=f'{base_name}.png')
-            screenshot_path = str(result or png_path)
-        except Exception:
-            screenshot_path = ''
-    except Exception:
-        screenshot_path = ''
-
-    return {'json': json_path, 'screenshot': screenshot_path}
+    return {
+        'json': json_path,
+        'screenshot': screenshot_path,
+        'screenshots': screenshot_paths,
+    }

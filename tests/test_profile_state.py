@@ -65,6 +65,35 @@ class ProfileSubmitStateTest(unittest.TestCase):
             self.assertEqual(payload['stage'], 'stalled')
             self.assertEqual(payload['reason'], 'no redirect')
 
+    def test_diagnostics_write_details_and_each_tab_screenshot(self):
+        class Page:
+            title = 'Page'
+            url = 'https://accounts.x.ai/sign-up'
+
+            def get_screenshot(self, path=None, name=None, full_page=False):
+                result = os.path.join(path, name)
+                with open(result, 'wb') as handle:
+                    handle.write(b'png')
+                return result
+
+        pages = [Page(), Page()]
+        with tempfile.TemporaryDirectory() as directory:
+            result = save_profile_diagnostics(
+                pages[0],
+                ProfileSubmitStage.STALLED,
+                reason='all tabs stalled',
+                directory=directory,
+                details={'browser': {'tab_count': 2}},
+                pages=pages,
+            )
+
+            self.assertEqual(len(result['screenshots']), 2)
+            self.assertTrue(all(os.path.exists(path) for path in result['screenshots']))
+            with open(result['json'], encoding='utf-8') as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload['details']['browser']['tab_count'], 2)
+            self.assertEqual(payload['screenshots'], result['screenshots'])
+
 
 if __name__ == '__main__':
     unittest.main()

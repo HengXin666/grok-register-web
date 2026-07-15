@@ -6,6 +6,7 @@ import random
 import secrets
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from DrissionPage.errors import PageDisconnectedError
 from config import SIGNUP_URL
@@ -1144,18 +1145,220 @@ return !!(givenInput && familyInput && passwordInput && !codeInput);
             time.sleep(0.5)
         return False
 
-    def _save_profile_diagnostics(self, stage, snapshot=None, reason=''):
+    def _warn_profile_probe(self, category, detail, interval=5):
+        """Rate-limit repeated page/tab probe warnings during unstable navigation."""
+        now = time.time()
+        cache = getattr(self, '_profile_probe_warning_cache', {})
+        previous = cache.get(category, {})
+        if (
+            previous.get('detail') == detail
+            and now - previous.get('time', 0) < interval
+        ):
+            return
+        logger.warning('%s: %s', category, detail)
+        cache[category] = {'detail': detail, 'time': now}
+        self._profile_probe_warning_cache = cache
+
+    def _browser_tabs(self):
+        """Return every live browser tab without assuming the last one is active."""
         try:
+            chromium = getattr(self.browser, 'browser', None)
+            if chromium is not None:
+                tabs = list(chromium.get_tabs() or [])
+                if tabs:
+                    return tabs
+        except Exception as exc:
+            self._warn_profile_probe(
+                'Failed to enumerate browser tabs',
+                f'{type(exc).__name__}: {exc}',
+            )
+        try:
+            page = getattr(self.browser, '_page', None)
+            if page is not None:
+                return [page]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _profile_completion_url(url):
+        """Return whether an xAI/Grok URL is beyond the sign-up page."""
+        value = str(url or '').strip()
+        if not value:
+            return False
+        lower = value.lower()
+        if 'sign-up' in lower or 'signup' in lower:
+            return False
+        try:
+            parsed = urlparse(value)
+            host = (parsed.hostname or '').lower()
+        except Exception:
+            return False
+        return bool(
+            parsed.scheme in ('http', 'https')
+            and (
+                host == 'grok.com'
+                or host.endswith('.grok.com')
+                or host == 'x.ai'
+                or host.endswith('.x.ai')
+            )
+        )
+
+    def _select_browser_tab(self, tab):
+        try:
+            self.browser._page = tab
+        except Exception:
+            pass
+
+    @staticmethod
+    def _tab_id(tab, index):
+        for name in ('tab_id', '_tab_id', 'id'):
+            try:
+                value = getattr(tab, name, None)
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        return f'tab-{index}'
+
+    def _sanitize_profile_diagnostic(self, value):
+        if isinstance(value, dict):
+            return {
+                str(key): self._sanitize_profile_diagnostic(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._sanitize_profile_diagnostic(item) for item in value]
+        if isinstance(value, str):
+            text = self._redact_network_text(value, 1200)
+            return re.sub(
+                r'(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+                '<redacted-email>',
+                text,
+            )
+        return value
+
+    def _collect_profile_tab_diagnostics(self):
+        """Capture URL/title and a secret-safe DOM summary for every browser tab."""
+        tabs = self._browser_tabs()
+        current = getattr(self.browser, '_page', None)
+        entries = []
+        for index, tab in enumerate(tabs, start=1):
+            entry = {
+                'index': index,
+                'tab_id': self._tab_id(tab, index),
+                'is_selected': tab is current,
+                'url': '',
+                'title': '',
+                'dom': {},
+                'capture_error': '',
+            }
+            try:
+                entry['url'] = str(getattr(tab, 'url', '') or '')
+            except Exception as exc:
+                entry['capture_error'] = f'url: {type(exc).__name__}: {exc}'
+            try:
+                entry['title'] = str(getattr(tab, 'title', '') or '')
+            except Exception as exc:
+                prior = entry['capture_error']
+                entry['capture_error'] = f'{prior}; ' if prior else ''
+                entry['capture_error'] += f'title: {type(exc).__name__}: {exc}'
+            try:
+                entry['dom'] = tab.run_js(r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden'
+    && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+}
+const inputs = Array.from(document.querySelectorAll('input')).slice(0, 30).map(n => ({
+  type: String(n.type || ''),
+  name: String(n.name || ''),
+  id: String(n.id || ''),
+  testId: String(n.getAttribute('data-testid') || ''),
+  autocomplete: String(n.autocomplete || ''),
+  visible: isVisible(n),
+  disabled: !!n.disabled,
+  readOnly: !!n.readOnly,
+  valueLength: String(n.value || '').length,
+}));
+const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+  .slice(0, 30).map(n => ({
+    text: String(n.innerText || n.textContent || n.value || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+    type: String(n.type || ''),
+    visible: isVisible(n),
+    disabled: !!n.disabled,
+    ariaDisabled: String(n.getAttribute('aria-disabled') || ''),
+  }));
+const notices = Array.from(document.querySelectorAll(
+  '[role="alert"], [data-testid="error-message"], h1, h2, h3'
+)).filter(isVisible).slice(0, 20).map(n =>
+  String(n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240)
+).filter(Boolean);
+const cf = document.querySelector('input[name="cf-turnstile-response"]');
+return {
+  href: String(location.href || ''),
+  readyState: String(document.readyState || ''),
+  bodyTextLength: String(document.body?.innerText || '').length,
+  hasGivenName: !!document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]'),
+  hasFamilyName: !!document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]'),
+  hasPassword: !!document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]'),
+  cfLength: cf ? String(cf.value || '').length : -1,
+  inputs,
+  buttons,
+  notices,
+};
+                """) or {}
+            except Exception as exc:
+                prior = entry['capture_error']
+                entry['capture_error'] = f'{prior}; ' if prior else ''
+                entry['capture_error'] += f'dom: {type(exc).__name__}: {exc}'
+            entries.append(self._sanitize_profile_diagnostic(entry))
+        return tabs, {
+            'captured_at': datetime.now(timezone.utc).isoformat(),
+            'tab_count': len(tabs),
+            'tabs': entries,
+        }
+
+    @staticmethod
+    def _tab_log_summary(details):
+        result = []
+        for item in (details or {}).get('tabs', []):
+            dom = item.get('dom') or {}
+            result.append({
+                'index': item.get('index'),
+                'selected': item.get('is_selected'),
+                'url': item.get('url') or dom.get('href'),
+                'ready': dom.get('readyState'),
+                'profile': bool(
+                    dom.get('hasGivenName')
+                    and dom.get('hasFamilyName')
+                    and dom.get('hasPassword')
+                ),
+                'cfLen': dom.get('cfLength'),
+                'error': item.get('capture_error'),
+            })
+        return result
+
+    def _save_profile_diagnostics(self, stage, snapshot=None, reason='',
+                                  details=None):
+        try:
+            tabs, tab_details = self._collect_profile_tab_diagnostics()
+            merged_details = dict(details or {})
+            merged_details['browser'] = tab_details
             result = save_profile_diagnostics(
                 self.browser.page,
                 stage,
                 snapshot=snapshot,
                 reason=reason,
+                details=merged_details,
+                pages=tabs,
             )
             logger.warning(
-                'Profile diagnostics saved: json=%s screenshot=%s',
+                'Profile diagnostics saved: json=%s screenshots=%s',
                 result.get('json') or 'none',
-                result.get('screenshot') or 'none',
+                result.get('screenshots') or 'none',
             )
             return result
         except Exception as exc:
@@ -1248,20 +1451,64 @@ return !!(givenInput && familyInput && passwordInput && !codeInput);
             )
 
     def _profile_completion_reason(self):
-        """Detect successful registration even when xAI auto-submits the form."""
-        try:
-            sso = self._check_sso_cookie()
-            if sso:
-                return f'sso-cookie:{len(sso)}'
-        except Exception:
-            pass
-        try:
-            url = str(self.browser.page.url or '')
-            lower = url.lower()
-            if url and 'sign-up' not in lower and 'signup' not in lower:
-                return f'navigated:{url[:160]}'
-        except Exception:
-            pass
+        """Detect successful registration across every live browser tab."""
+        tabs = self._browser_tabs()
+        probe_errors = []
+        for index, tab in enumerate(tabs, start=1):
+            sso_value = ''
+            try:
+                cookies = tab.cookies(all_domains=True, all_info=True) or []
+                for item in cookies:
+                    name = (
+                        str(item.get('name', '')).strip()
+                        if isinstance(item, dict)
+                        else str(getattr(item, 'name', '')).strip()
+                    )
+                    value = (
+                        str(item.get('value', '')).strip()
+                        if isinstance(item, dict)
+                        else str(getattr(item, 'value', '')).strip()
+                    )
+                    if name == 'sso' and value:
+                        sso_value = value
+                        break
+            except Exception as exc:
+                probe_errors.append(
+                    f'tab-{index} cookies: {type(exc).__name__}: {exc}'
+                )
+            if not sso_value:
+                try:
+                    js_cookies = str(tab.run_js('return document.cookie') or '')
+                    for pair in js_cookies.split(';'):
+                        if '=' not in pair:
+                            continue
+                        name, value = pair.strip().split('=', 1)
+                        if name.strip() == 'sso' and value.strip():
+                            sso_value = value.strip()
+                            break
+                except Exception as exc:
+                    probe_errors.append(
+                        f'tab-{index} document.cookie: '
+                        f'{type(exc).__name__}: {exc}'
+                    )
+            if sso_value:
+                self._select_browser_tab(tab)
+                return f'sso-cookie:{len(sso_value)}:tab-{index}'
+        for index, tab in enumerate(tabs, start=1):
+            try:
+                url = str(tab.url or '')
+                if self._profile_completion_url(url):
+                    self._select_browser_tab(tab)
+                    return f'navigated-tab-{index}:{url[:160]}'
+            except Exception as exc:
+                probe_errors.append(
+                    f'tab-{index} url: {type(exc).__name__}: {exc}'
+                )
+        if probe_errors:
+            self._warn_profile_probe(
+                'Profile completion tab probe errors',
+                '; '.join(probe_errors)[:1200],
+            )
         return ''
 
     def _dismiss_cookie_banner(self):
@@ -1344,6 +1591,9 @@ return 'clicked-text:' + (btn.innerText || btn.value || '').trim().slice(0, 40);
             first, last = 'Test', 'User'
 
         deadline = time.time() + timeout
+        last_transient_error = ''
+        last_transient_error_log = 0.0
+        last_not_ready_log = 0.0
         self._dismiss_cookie_banner()
 
         while time.time() < deadline:
@@ -1419,6 +1669,14 @@ return [
                 )
 
                 if filled == 'not-ready':
+                    now = time.time()
+                    if now - last_not_ready_log >= 10:
+                        last_not_ready_log = now
+                        _, tab_details = self._collect_profile_tab_diagnostics()
+                        logger.info(
+                            'Profile form not ready; tab state=%s',
+                            self._tab_log_summary(tab_details),
+                        )
                     time.sleep(0.5)
                     continue
 
@@ -1809,6 +2067,31 @@ return {
                     '注册邮箱已存在',
                 )):
                     raise
+                completion = self._profile_completion_reason()
+                if completion:
+                    logger.info(
+                        'Profile registration completed after transient page error: %s',
+                        completion,
+                    )
+                    return
+                last_transient_error = f'{type(e).__name__}: {msg or repr(e)}'
+                now = time.time()
+                if (
+                    last_transient_error != getattr(
+                        self, '_last_profile_transient_error', '',
+                    )
+                    or now - last_transient_error_log >= 5
+                ):
+                    self._last_profile_transient_error = last_transient_error
+                    last_transient_error_log = now
+                    logger.warning(
+                        'Profile flow transient exception (retrying): %s',
+                        last_transient_error,
+                    )
+                    logger.debug(
+                        'Profile flow transient exception traceback',
+                        exc_info=True,
+                    )
             time.sleep(0.5)
 
         completion = self._profile_completion_reason()
@@ -1818,6 +2101,20 @@ return {
                 completion,
             )
             return
+        _, tab_details = self._collect_profile_tab_diagnostics()
+        logger.warning(
+            'Profile final timeout tab state: %s',
+            self._tab_log_summary(tab_details),
+        )
+        reason = 'Profile form or enabled submit button was not found before deadline'
+        if last_transient_error:
+            reason += f'; last transient error: {last_transient_error}'
+        self._save_profile_diagnostics(
+            ProfileSubmitStage.STALLED,
+            ProfileSubmitSnapshot(),
+            reason,
+            details={'timeout_browser_snapshot': tab_details},
+        )
         raise Exception("未找到最终注册表单或完成注册按钮")
 
     def _solve_turnstile(self):
