@@ -281,7 +281,7 @@ class RegistrationEngine:
             # 5. Fill profile
             self.state.check_pause()
             logger.info("Filling profile information...")
-            self._fill_profile(password, settings)
+            self._fill_profile(password, settings, alias_email=alias_email)
 
             # 6. Extract SSO (turnstile is handled inside _fill_profile)
             logger.info("Extracting SSO token...")
@@ -1232,6 +1232,23 @@ return !!(givenInput && familyInput && passwordInput && !codeInput);
                 packet.get('body'),
             )
 
+    def _profile_completion_reason(self):
+        """Detect successful registration even when xAI auto-submits the form."""
+        try:
+            sso = self._check_sso_cookie()
+            if sso:
+                return f'sso-cookie:{len(sso)}'
+        except Exception:
+            pass
+        try:
+            url = str(self.browser.page.url or '')
+            lower = url.lower()
+            if url and 'sign-up' not in lower and 'signup' not in lower:
+                return f'navigated:{url[:160]}'
+        except Exception:
+            pass
+        return ''
+
     def _dismiss_cookie_banner(self):
         """Dismiss OneTrust/cookie consent banners that block form submit."""
         if self._cookie_banner_dismissed:
@@ -1304,7 +1321,7 @@ return 'clicked-text:' + (btn.innerText || btn.value || '').trim().slice(0, 40);
             logger.warning(f"Cookie banner check: {e}")
         return False
 
-    def _fill_profile(self, password, settings, timeout=120):
+    def _fill_profile(self, password, settings, alias_email='', timeout=120):
         """Fill profile form (name + password) and submit with turnstile handling."""
         if settings.get('random_name_enabled', 'true') == 'true':
             first, last = self._generate_random_name()
@@ -1316,6 +1333,13 @@ return 'clicked-text:' + (btn.innerText || btn.value || '').trim().slice(0, 40);
 
         while time.time() < deadline:
             try:
+                completion = self._profile_completion_reason()
+                if completion:
+                    logger.info(
+                        'Profile registration completed before explicit submit: %s',
+                        completion,
+                    )
+                    return
                 self._dismiss_cookie_banner()
                 existing_account = self.browser.run_js(r"""
 const body = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
@@ -1415,6 +1439,10 @@ return String(givenInput.value || '').trim() === String(expectedGiven || '').tri
                         time.sleep(0.5)
                         continue
 
+                    # xAI may submit automatically as soon as Turnstile resolves,
+                    # so listen before solving rather than only before button click.
+                    profile_listener = self._start_profile_network_capture()
+
                     # Check turnstile BEFORE clicking submit (like original script)
                     turnstile_state = self.browser.run_js("""
 const ci = document.querySelector('input[name="cf-turnstile-response"]');
@@ -1446,6 +1474,28 @@ if (ci) {
                             logger.warning(f"Turnstile token missing/short: {str(turnstile_token)[:40] if turnstile_token else None}")
                         # Give React form a moment to enable submit after CF callback
                         time.sleep(1.5)
+
+                    # Some xAI variants auto-submit after the Turnstile callback and
+                    # remove the profile form without exposing a final button.
+                    auto_deadline = time.time() + 12
+                    while time.time() < auto_deadline:
+                        completion = self._profile_completion_reason()
+                        if completion:
+                            network_packets = self._collect_profile_network_capture(
+                                profile_listener,
+                                timeout=1,
+                            )
+                            self._log_profile_network_capture(
+                                network_packets,
+                                alias_email,
+                            )
+                            logger.info(
+                                'Profile completed automatically after Turnstile: %s',
+                                completion,
+                            )
+                            logger.info(f"Filled profile: {first} {last}")
+                            return
+                        time.sleep(0.5)
 
                     self._dismiss_cookie_banner()
 
@@ -1495,7 +1545,6 @@ return enabled ? 'enabled' : 'disabled';
                     # Click submit only when the page has enabled it. Never mutate
                     # disabled state: React/Turnstile uses that state as part of
                     # its server-side submission contract.
-                    profile_listener = self._start_profile_network_capture()
                     clicked = self.browser.run_js(r"""
 function isVisible(node) {
     if (!node) return false;
@@ -1539,7 +1588,7 @@ return hasCF ? 'clicked-cf' : 'clicked-no-cf';
                         profile_listener,
                         timeout=8,
                     )
-                    self._log_profile_network_capture(network_packets, email)
+                    self._log_profile_network_capture(network_packets, alias_email)
                     logger.info(f"Profile submit result: {clicked}")
                     if not clicked or str(clicked).startswith(('no-enabled-button', 'no-button', 'disabled')):
                         raise Exception(
@@ -1747,6 +1796,13 @@ return {
                     raise
             time.sleep(0.5)
 
+        completion = self._profile_completion_reason()
+        if completion:
+            logger.info(
+                'Profile registration completed at timeout boundary: %s',
+                completion,
+            )
+            return
         raise Exception("未找到最终注册表单或完成注册按钮")
 
     def _solve_turnstile(self):
