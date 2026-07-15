@@ -231,6 +231,7 @@ class Grok2APIClient:
     def import_web_sso_and_convert(self, sso_cookie, email=''):
         token = self._login()
         account_name = email.strip() or f'Grok Web {secrets.token_hex(4)}'
+        logger.info('grok2api Web import started: account=%s', account_name)
         document = json.dumps({
             'provider': 'grok_web',
             'accounts': [{'name': account_name, 'sso_token': sso_cookie.strip(), 'tier': 'auto'}],
@@ -261,7 +262,17 @@ class Grok2APIClient:
                 imported = payload
         if imported is None:
             raise Grok2APIError('grok2api web import returned no completion event')
+        logger.info(
+            'grok2api Web import completed: account=%s created=%s updated=%s '
+            'synced=%s sync_failed=%s',
+            account_name,
+            imported.get('created', 0),
+            imported.get('updated', 0),
+            imported.get('synced', 0),
+            imported.get('syncFailed', 0),
+        )
 
+        logger.info('grok2api locating imported Web account: account=%s', account_name)
         lookup = self.session.get(
             f'{self.base_url}/api/admin/v1/accounts',
             headers={'Authorization': f'Bearer {token}'},
@@ -276,14 +287,31 @@ class Grok2APIClient:
         if not account or not account.get('id'):
             raise Grok2APIError(f'grok2api could not locate imported Web account {account_name}')
 
+        account_id = str(account['id'])
+        logger.info(
+            'grok2api Build conversion started: account=%s web_account_id=%s',
+            account_name, account_id,
+        )
         converted = self._run_sse_task(
             '/api/admin/v1/accounts/web/convert-to-build',
-            json_body={'ids': [str(account['id'])]},
+            json_body={'ids': [account_id]},
         )
         if int(converted.get('failed', 0) or 0) > 0:
             raise Grok2APIError(
-                f'grok2api Build conversion failed for Web account {account["id"]}'
+                f'grok2api Build conversion failed for Web account {account_id}'
             )
+        logger.info(
+            'grok2api Build conversion completed: account=%s web_account_id=%s '
+            'created=%s linked=%s skipped=%s failed=%s synced=%s sync_failed=%s',
+            account_name,
+            account_id,
+            converted.get('created', 0),
+            converted.get('linked', 0),
+            converted.get('skipped', 0),
+            converted.get('failed', 0),
+            converted.get('synced', 0),
+            converted.get('syncFailed', 0),
+        )
         return {'import': imported, 'conversion': converted}
 
     def upsert_web_egress_context(self, user_agent, cloudflare_cookies):
@@ -320,6 +348,7 @@ class Grok2APIClient:
 
 def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudflare_cookies=''):
     if settings.get('grok2api_auto_upload', 'false') != 'true':
+        logger.info('grok2api auto upload disabled; skipping Web import and Build conversion')
         return None
     base_url = settings.get('grok2api_url', '').strip()
     username = settings.get('grok2api_username', '').strip()
@@ -327,8 +356,8 @@ def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudfl
     if not base_url or not username or not password:
         raise Grok2APIError('grok2api auto upload is enabled but URL/username/password is incomplete')
     client = Grok2APIClient(base_url, username, password)
+    logger.info('grok2api auto pipeline started: account=%s endpoint=%s', email or '(unnamed)', base_url)
     if user_agent and cloudflare_cookies:
         logger.info('Updating grok2api Grok Web egress Cloudflare context...')
         client.upsert_web_egress_context(user_agent, cloudflare_cookies)
-    logger.info('Uploading registered SSO to grok2api Grok Web and converting unlinked accounts...')
     return client.import_web_sso_and_convert(sso_cookie, email=email)

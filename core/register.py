@@ -328,13 +328,18 @@ class RegistrationEngine:
                     converted = upload_result.get('conversion', {})
                     logger.info(
                         'grok2api auto pipeline completed: web_created=%s web_updated=%s '
-                        'build_created=%s linked=%s skipped=%s failed=%s',
+                        'web_synced=%s web_sync_failed=%s build_created=%s linked=%s '
+                        'skipped=%s failed=%s build_synced=%s build_sync_failed=%s',
                         imported.get('created', 0),
                         imported.get('updated', 0),
+                        imported.get('synced', 0),
+                        imported.get('syncFailed', 0),
                         converted.get('created', 0),
                         converted.get('linked', 0),
                         converted.get('skipped', 0),
                         converted.get('failed', 0),
+                        converted.get('synced', 0),
+                        converted.get('syncFailed', 0),
                     )
             except Exception as upload_error:
                 logger.warning(f'grok2api auto upload failed: {upload_error}')

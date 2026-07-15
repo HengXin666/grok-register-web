@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import Mock
 
-from core.grok2api_client import Grok2APIClient, Grok2APIError
+from core.grok2api_client import Grok2APIClient, Grok2APIError, upload_registered_sso
 
 
 class Grok2APIClientTest(unittest.TestCase):
@@ -54,12 +54,32 @@ class Grok2APIClientTest(unittest.TestCase):
         client = Grok2APIClient('http://localhost:21434', 'admin', 'secret')
         client.session = session
 
-        result = client.import_web_sso_and_convert('sso-token', email='user@example.com')
+        with self.assertLogs('register', level='INFO') as logs:
+            result = client.import_web_sso_and_convert('sso-token', email='user@example.com')
 
         self.assertEqual(result['import']['created'], 1)
         self.assertEqual(result['conversion']['created'], 1)
+        output = '\n'.join(logs.output)
+        self.assertIn('grok2api Web import started: account=user@example.com', output)
+        self.assertIn('grok2api Web import completed: account=user@example.com created=1', output)
+        self.assertIn('grok2api Build conversion started: account=user@example.com web_account_id=42', output)
+        self.assertIn('grok2api Build conversion completed: account=user@example.com web_account_id=42 created=1', output)
         conversion_call = session.post.call_args_list[3]
         self.assertEqual(conversion_call.kwargs['json'], {'ids': ['42']})
+
+    def test_disabled_auto_upload_is_explicitly_logged(self):
+        with self.assertLogs('register', level='INFO') as logs:
+            result = upload_registered_sso(
+                {'grok2api_auto_upload': 'false'},
+                'sso-token',
+                email='user@example.com',
+            )
+
+        self.assertIsNone(result)
+        self.assertIn(
+            'grok2api auto upload disabled; skipping Web import and Build conversion',
+            '\n'.join(logs.output),
+        )
 
     def test_web_sso_conversion_rejects_failed_completion_summary(self):
         session = Mock()
