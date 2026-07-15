@@ -25,7 +25,14 @@ def init_settings_api(db):
         if not filtered:
             return jsonify({'success': False, 'data': None, 'message': 'No valid settings keys provided'})
 
-        db.update_settings(filtered)
+        try:
+            db.update_settings(filtered)
+        except ValueError as exc:
+            return jsonify({
+                'success': False,
+                'data': None,
+                'message': str(exc),
+            }), 400
         return jsonify({'success': True, 'data': db.get_settings(), 'message': 'Settings updated'})
 
     return settings_bp

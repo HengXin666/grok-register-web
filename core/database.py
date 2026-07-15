@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
 }
 
 DEPRECATED_SETTING_KEYS = ('email_provider',)
+MAX_ALIASES_SETTING_KEY = 'max_aliases_per_account'
 
 
 class Database:
@@ -146,6 +147,8 @@ class Database:
                     (key, value)
                 )
             self._remove_deprecated_settings(cur)
+            max_aliases = self._get_max_aliases_setting_locked(cur)
+            self._sync_account_alias_limits_locked(cur, max_aliases)
             self.conn.commit()
             logger.info("Database initialized successfully")
 
@@ -154,6 +157,68 @@ class Database:
         cursor.executemany(
             'DELETE FROM settings WHERE key = ?',
             ((key,) for key in DEPRECATED_SETTING_KEYS),
+        )
+
+    @staticmethod
+    def _parse_max_aliases(value):
+        try:
+            max_aliases = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError('max_aliases_per_account must be a positive integer') from exc
+        if max_aliases < 1:
+            raise ValueError('max_aliases_per_account must be a positive integer')
+        return max_aliases
+
+    @classmethod
+    def _get_max_aliases_setting_locked(cls, cursor):
+        row = cursor.execute(
+            'SELECT value FROM settings WHERE key = ?',
+            (MAX_ALIASES_SETTING_KEY,),
+        ).fetchone()
+        value = row['value'] if row else DEFAULT_SETTINGS[MAX_ALIASES_SETTING_KEY]
+        try:
+            return cls._parse_max_aliases(value)
+        except ValueError:
+            fallback = cls._parse_max_aliases(DEFAULT_SETTINGS[MAX_ALIASES_SETTING_KEY])
+            logger.warning(
+                'Invalid stored %s=%r; restoring default %s',
+                MAX_ALIASES_SETTING_KEY,
+                value,
+                fallback,
+            )
+            cursor.execute(
+                '''INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                       updated_at=CURRENT_TIMESTAMP''',
+                (MAX_ALIASES_SETTING_KEY, str(fallback)),
+            )
+            return fallback
+
+    @staticmethod
+    def _sync_account_alias_limits_locked(cursor, max_aliases):
+        cursor.execute(
+            '''UPDATE accounts SET max_aliases=?, updated_at=CURRENT_TIMESTAMP
+               WHERE max_aliases != ?''',
+            (max_aliases, max_aliases),
+        )
+        cursor.execute(
+            '''UPDATE accounts
+               SET status = CASE
+                       WHEN (SELECT COUNT(*) FROM aliases
+                             WHERE account_id=accounts.id AND status='used') >= ?
+                       THEN 'done'
+                       ELSE 'ready'
+                   END,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE status != 'disabled'
+                 AND status != CASE
+                       WHEN (SELECT COUNT(*) FROM aliases
+                             WHERE account_id=accounts.id AND status='used') >= ?
+                       THEN 'done'
+                       ELSE 'ready'
+                   END''',
+            (max_aliases, max_aliases),
         )
 
     @staticmethod
@@ -236,10 +301,12 @@ class Database:
                 self.conn.commit()
                 return existing['id']
             else:
+                max_aliases = self._get_max_aliases_setting_locked(cur)
                 cur.execute(
-                    '''INSERT INTO accounts (email, password, client_id, refresh_token)
-                       VALUES (?, ?, ?, ?)''',
-                    (email, password, client_id, refresh_token)
+                    '''INSERT INTO accounts (
+                           email, password, client_id, refresh_token, max_aliases
+                       ) VALUES (?, ?, ?, ?, ?)''',
+                    (email, password, client_id, refresh_token, max_aliases)
                 )
                 self.conn.commit()
                 return cur.lastrowid
@@ -1046,13 +1113,23 @@ class Database:
 
     def update_settings(self, settings):
         with self._write_lock:
-            for key, value in settings.items():
+            normalized = dict(settings)
+            max_aliases = None
+            if MAX_ALIASES_SETTING_KEY in normalized:
+                max_aliases = self._parse_max_aliases(
+                    normalized[MAX_ALIASES_SETTING_KEY]
+                )
+                normalized[MAX_ALIASES_SETTING_KEY] = str(max_aliases)
+
+            for key, value in normalized.items():
                 self.conn.execute(
                     '''INSERT INTO settings (key, value, updated_at)
                        VALUES (?, ?, CURRENT_TIMESTAMP)
                        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP''',
                     (key, str(value))
                 )
+            if max_aliases is not None:
+                self._sync_account_alias_limits_locked(self.conn, max_aliases)
             self.conn.commit()
 
     def reset_settings(self):
@@ -1065,6 +1142,10 @@ class Database:
                        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP''',
                     (key, value)
                 )
+            max_aliases = self._parse_max_aliases(
+                DEFAULT_SETTINGS[MAX_ALIASES_SETTING_KEY]
+            )
+            self._sync_account_alias_limits_locked(self.conn, max_aliases)
             self.conn.commit()
 
     # ── Recovery ───────────────────────────────────────────────
