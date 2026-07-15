@@ -904,7 +904,7 @@ return orderedBoxes.map(n => String(n.value || '').trim()).join('') === code ? '
             except PageDisconnectedError:
                 # Page navigated after confirmation, handle like original
                 self._refresh_active_page()
-                if self._has_profile_form():
+                if self._wait_for_stable_profile_form(timeout=3):
                     logger.info("Page navigated after code submission, profile form detected")
                     return
                 time.sleep(1)
@@ -915,7 +915,10 @@ return orderedBoxes.map(n => String(n.value || '').trim()).join('') === code ? '
                 continue
 
             if filled == 'not-ready':
-                if self._has_profile_form():
+                if (
+                    self._has_profile_form()
+                    and self._wait_for_stable_profile_form(timeout=3)
+                ):
                     logger.info("Already on profile page, skipping code confirmation")
                     return
                 time.sleep(0.5)
@@ -972,7 +975,7 @@ return 'clicked';
                 except PageDisconnectedError:
                     # Page navigated after click, like original
                     self._refresh_active_page()
-                    if self._has_profile_form():
+                    if self._wait_for_stable_profile_form(timeout=3):
                         logger.info("Profile form detected after confirm click")
                         return
                     clicked = 'disconnected'
@@ -987,7 +990,10 @@ return 'clicked';
                     for _ in range(30):
                         time.sleep(0.5)
                         try:
-                            if self._has_profile_form():
+                            if (
+                                self._has_profile_form()
+                                and self._wait_for_stable_profile_form(timeout=3)
+                            ):
                                 logger.info("Profile page ready after code confirmation")
                                 return
                             new_url = self.browser.page.url if self.browser.page else ''
@@ -1037,17 +1043,18 @@ if (btns.length) {
                             pass
                         time.sleep(3)
 
-                    if self._has_profile_form():
+                    if self._wait_for_stable_profile_form(timeout=3):
                         logger.info("Profile page ready after retry")
                         return
 
                     raise Exception("确认邮箱失败，页面无响应，需要关闭浏览器重试")
 
                 if clicked == 'no-button':
-                    current_url = self.browser.page.url if self.browser.page else ''
-                    if 'sign-up' in current_url or 'signup' in current_url:
-                        logger.info(f"Code filled, page auto-navigated: {current_url}")
+                    if self._wait_for_stable_profile_form(timeout=3):
+                        logger.info("Code filled and profile form became stable")
                         return
+                    time.sleep(0.5)
+                    continue
 
                 if clicked == 'disconnected':
                     time.sleep(1)
@@ -1091,11 +1098,36 @@ return { url: location.href, inputs, buttons };
 const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
 const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
 const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]');
-return !!(givenInput && familyInput && passwordInput);
+const codeInput = Array.from(document.querySelectorAll('input')).find((node) => {
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  if (style.display === 'none' || style.visibility === 'hidden'
+      || rect.width <= 0 || rect.height <= 0) return false;
+  const meta = [node.name, node.id, node.placeholder, node.autocomplete,
+    node.getAttribute('data-testid'), node.getAttribute('aria-label')]
+    .join(' ').toLowerCase();
+  return meta.includes('code') || meta.includes('otp')
+    || meta.includes('verification') || Number(node.maxLength || 0) === 6;
+});
+return !!(givenInput && familyInput && passwordInput && !codeInput);
                 """
             ))
         except Exception:
             return False
+
+    def _wait_for_stable_profile_form(self, timeout=3, consecutive=3):
+        """Require the profile form to remain visible before leaving OTP flow."""
+        deadline = time.time() + timeout
+        stable = 0
+        while time.time() < deadline:
+            if self._has_profile_form():
+                stable += 1
+                if stable >= consecutive:
+                    return True
+            else:
+                stable = 0
+            time.sleep(0.5)
+        return False
 
     def _save_profile_diagnostics(self, stage, snapshot=None, reason=''):
         try:
