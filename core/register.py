@@ -1317,6 +1317,19 @@ return 'clicked-text:' + (btn.innerText || btn.value || '').trim().slice(0, 40);
         while time.time() < deadline:
             try:
                 self._dismiss_cookie_banner()
+                existing_account = self.browser.run_js(r"""
+const body = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+const lower = body.toLowerCase();
+if (lower.includes('existing account found')
+    || lower.includes('an account already exists which is associated with this email address')) {
+  return body.slice(0, 500);
+}
+return '';
+                """)
+                if existing_account:
+                    raise Exception(
+                        '注册邮箱已存在：xAI reports Existing account found'
+                    )
                 filled = self.browser.run_js(
                     """
 const givenName = arguments[0];
@@ -1729,6 +1742,7 @@ return {
                 if any(k in msg for k in (
                     '注册提交失败', '注册提交未生效', '注册提交超时',
                     '注册提交按钮未启用', '注册提交缺少有效', 'Turnstile',
+                    '注册邮箱已存在',
                 )):
                     raise
             time.sleep(0.5)
