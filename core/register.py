@@ -43,6 +43,12 @@ from core.runtime import resolve_browser_headless, resolve_registration_concurre
 
 logger = logging.getLogger('register')
 
+MIN_VERIFICATION_CODE_POLLS = 10
+
+
+class DuplicateSSOError(RuntimeError):
+    """The newly completed flow returned an SSO identity already seen locally."""
+
 
 class RegistrationEngine:
     def __init__(self, db, browser_mgr, email_mgr, socketio, state):
@@ -254,9 +260,11 @@ class RegistrationEngine:
         try:
             if page:
                 if keep_cloudflare:
-                    # Remove account identity and site state, but do not clear
-                    # grok.com cookies/cache containing cf_clearance.
-                    clear_sso_cookies(page)
+                    # Capture the reusable CF context first, then clear the
+                    # entire browser cookie/cache jar. Selective cookie deletion
+                    # can miss host-only xAI cookies and cause stale SSO reuse.
+                    page.run_cdp('Network.clearBrowserCookies')
+                    page.run_cdp('Network.clearBrowserCache')
                     for origin in ['https://accounts.x.ai', 'https://auth.x.ai', 'https://x.ai']:
                         try:
                             page.run_cdp(
@@ -340,7 +348,10 @@ class RegistrationEngine:
             code = self.email_mgr.get_code_for_alias(
                 alias_email, alias['account_id'],
                 alias['client_id'], alias['refresh_token'],
-                max_retries=int(settings.get('max_code_retries', 3)),
+                max_retries=max(
+                    MIN_VERIFICATION_CODE_POLLS,
+                    int(settings.get('max_code_retries', 3) or 3),
+                ),
                 main_email=alias.get('main_email'),
                 requested_after=verification_requested_at,
             )
@@ -358,6 +369,14 @@ class RegistrationEngine:
             # 6. Extract SSO (turnstile is handled inside _fill_profile)
             logger.info("Extracting SSO token...")
             sso = self._extract_sso()
+
+            duplicate = self.db.find_existing_sso(sso)
+            if duplicate:
+                fingerprint = duplicate.get('fingerprint', '')[:12]
+                raise DuplicateSSOError(
+                    f'Duplicate SSO identity detected (sha256={fingerprint}, '
+                    f'previous={duplicate.get("email", "unknown")})'
+                )
 
             # The signup redirect may already have established grok.com
             # clearance. Capture it before activation/navigation changes the
@@ -534,6 +553,32 @@ class RegistrationEngine:
                     'reason': 'existing_account',
                     'duration': round(duration, 1),
                 })
+                self._emit_status()
+                if not self.state.should_stop():
+                    try:
+                        self._restart_browser(force_close=True)
+                    except Exception:
+                        pass
+                return
+            if isinstance(e, DuplicateSSOError):
+                # A stale browser identity is recoverable. Count one special
+                # retry, force-close the browser, and let claim_next_alias()
+                # reclaim this same alias once more even when normal retries=1.
+                duplicate_limit = max_retries + 1
+                outcome = self.db.finish_registration_attempt(
+                    reg_id=reg_id,
+                    alias_id=alias['id'],
+                    lease_owner=lease_owner,
+                    error=error_msg,
+                    duration=duration,
+                    max_retries=duplicate_limit,
+                )
+                logger.warning(
+                    'Round %s returned a duplicate SSO; retry=%s terminal=%s',
+                    round_num,
+                    outcome.get('retry_count', 0),
+                    outcome.get('terminal', False),
+                )
                 self._emit_status()
                 if not self.state.should_stop():
                     try:

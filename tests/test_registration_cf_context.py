@@ -42,9 +42,9 @@ class RegistrationCloudflareContextTest(unittest.TestCase):
         engine._restart_browser(force_close=False)
 
         commands = [call.args[0] for call in page.run_cdp.call_args_list if call.args]
-        self.assertNotIn('Network.clearBrowserCookies', commands)
-        self.assertNotIn('Network.clearBrowserCache', commands)
-        self.assertIn('Network.deleteCookies', commands)
+        self.assertIn('Network.clearBrowserCookies', commands)
+        self.assertIn('Network.clearBrowserCache', commands)
+        self.assertNotIn('Network.deleteCookies', commands)
         self.assertTrue(engine._cloudflare_context.ready)
         restored = [
             call for call in new_page.run_cdp.call_args_list

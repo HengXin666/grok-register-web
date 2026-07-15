@@ -227,6 +227,44 @@ class ConcurrentAliasClaimTest(unittest.TestCase):
         self.assertNotEqual(next_alias['id'], alias['id'])
         self.assertEqual(next_alias['alias_index'], 1)
 
+    def test_duplicate_sso_is_detected_and_reclaimable_once(self):
+        self._add_accounts(1)
+        first = self.db.claim_next_alias(1, 'worker-1', lease_seconds=60)
+        first_reg = self.db.create_registration(
+            first['id'], first['alias_email'], 'password', 1,
+            lease_owner='worker-1',
+        )
+        self.db.complete_registration_success(
+            first_reg, first['id'], 'worker-1', 'same-sso', 1.0,
+        )
+
+        self.assertEqual(
+            self.db.find_existing_sso('same-sso')['email'],
+            first['alias_email'],
+        )
+
+        second = self.db.claim_next_alias(1, 'worker-2', lease_seconds=60)
+        second_reg = self.db.create_registration(
+            second['id'], second['alias_email'], 'password', 2,
+            lease_owner='worker-2',
+        )
+        outcome = self.db.finish_registration_attempt(
+            second_reg, second['id'], 'worker-2',
+            'Duplicate SSO identity detected (sha256=abc)', 1.0, 2,
+        )
+        self.assertFalse(outcome['terminal'])
+
+        row = self.db.conn.execute(
+            'SELECT status, retry_count, failure_category FROM aliases WHERE id=?',
+            (second['id'],),
+        ).fetchone()
+        self.assertEqual(row['status'], 'ready')
+        self.assertEqual(row['retry_count'], 1)
+        self.assertEqual(row['failure_category'], 'sso_duplicate')
+
+        reclaimed = self.db.claim_next_alias(1, 'worker-3', lease_seconds=60)
+        self.assertEqual(reclaimed['id'], second['id'])
+
 
 class RegistrationStateConcurrencyTest(unittest.TestCase):
     def test_active_workers_and_counters_are_thread_safe(self):

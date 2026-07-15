@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from config import DB_PATH
 from core.failure_policy import (
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SETTINGS = {
     'max_aliases_per_account': '5',
-    'max_code_retries': '3',
+    'max_code_retries': '10',
     'max_confirm_retries': '3',
     'max_retries_per_alias': '3',
     'registration_timeout': '300',
@@ -547,7 +548,13 @@ class Database:
                        FROM aliases al
                        JOIN accounts a ON al.account_id = a.id
                        WHERE al.status = 'ready'
-                         AND al.retry_count < ?
+                         AND (
+                           al.retry_count < ?
+                           OR (
+                             al.retry_count = ?
+                             AND al.failure_category = 'sso_duplicate'
+                           )
+                         )
                          AND a.status = 'ready'
                          AND NOT EXISTS (
                              SELECT 1 FROM aliases active
@@ -556,7 +563,7 @@ class Database:
                          )
                        ORDER BY al.account_id ASC, al.alias_index ASC
                        LIMIT 1''',
-                    (max_retries,),
+                    (max_retries, max_retries),
                 ).fetchone()
 
                 if row:
@@ -760,11 +767,17 @@ class Database:
                    FROM aliases al
                    JOIN accounts a ON al.account_id = a.id
                    WHERE al.status = 'ready'
-                     AND al.retry_count < ?
+                     AND (
+                       al.retry_count < ?
+                       OR (
+                         al.retry_count = ?
+                         AND al.failure_category = 'sso_duplicate'
+                       )
+                     )
                      AND a.status = 'ready'
                    ORDER BY al.account_id ASC, al.alias_index ASC
                    LIMIT 1''',
-                (max_retries,)
+                (max_retries, max_retries)
             ).fetchone()
             if row:
                 return dict(row)
@@ -993,6 +1006,43 @@ class Database:
                 self.conn.rollback()
                 raise
 
+    def find_existing_sso(self, sso_value):
+        """Find a previously committed registration using the same SSO identity."""
+        value = (sso_value or '').strip()
+        if not value:
+            return None
+        row = self.conn.execute(
+            '''SELECT id, email, created_at
+               FROM registrations
+               WHERE status='success' AND sso_value=?
+               ORDER BY id ASC LIMIT 1''',
+            (value,),
+        ).fetchone()
+        if row:
+            return {
+                'source': 'registration',
+                'id': row['id'],
+                'email': row['email'],
+                'created_at': row['created_at'],
+                'fingerprint': hashlib.sha256(value.encode()).hexdigest(),
+            }
+        row = self.conn.execute(
+            '''SELECT id, alias_email, used_at
+               FROM aliases
+               WHERE status='used' AND sso_value=?
+               ORDER BY id ASC LIMIT 1''',
+            (value,),
+        ).fetchone()
+        if row:
+            return {
+                'source': 'alias',
+                'id': row['id'],
+                'email': row['alias_email'],
+                'created_at': row['used_at'],
+                'fingerprint': hashlib.sha256(value.encode()).hexdigest(),
+            }
+        return None
+
     def finish_registration_attempt(self, reg_id, alias_id, lease_owner,
                                     error, duration, max_retries):
         """Atomically fail one attempt, decide retry/terminal state, and release its lease."""
@@ -1026,6 +1076,7 @@ class Database:
 
                 retry_count = int(alias['retry_count'] or 0) + 1
                 terminal = retry_count >= max_retries
+                failure_category = classify_failure(error)
                 if terminal:
                     completed_at = datetime.now().isoformat()
                     cur.execute(
@@ -1047,10 +1098,14 @@ class Database:
                 else:
                     cur.execute(
                         '''UPDATE aliases SET status='ready', retry_count=?,
-                           error_reason='', failure_category='', used_at=NULL,
+                           error_reason='', failure_category=?, used_at=NULL,
                            completed_at=NULL, lease_owner='', lease_expires_at=NULL
                            WHERE id=?''',
-                        (retry_count, alias_id),
+                        (
+                            retry_count,
+                            failure_category if failure_category == 'sso_duplicate' else '',
+                            alias_id,
+                        ),
                     )
                     disabled, reason = False, ''
                 self.conn.commit()
