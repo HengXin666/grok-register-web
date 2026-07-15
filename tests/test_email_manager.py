@@ -1,9 +1,10 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from config import SCOPES
 from core.email_manager import (
+    EmailError,
     EmailManager,
     EmailPermissionError,
 )
@@ -74,6 +75,7 @@ class EmailManagerGraphTest(unittest.TestCase):
         response.json.return_value = {
             'value': [{
                 'subject': 'Your Grok confirmation code',
+                'id': 'graph-message-1',
                 'from': {
                     'emailAddress': {
                         'name': 'xAI',
@@ -81,6 +83,9 @@ class EmailManagerGraphTest(unittest.TestCase):
                     },
                 },
                 'receivedDateTime': datetime.now(timezone.utc).isoformat(),
+                'toRecipients': [{
+                    'emailAddress': {'address': 'user+1@example.com'},
+                }],
                 'bodyPreview': 'Use the code below to validate your email.',
                 'body': {
                     'contentType': 'html',
@@ -90,7 +95,9 @@ class EmailManagerGraphTest(unittest.TestCase):
         }
         get.return_value = response
 
-        code = self.manager._graph_get_code('graph-access-token')
+        code = self.manager._graph_get_code(
+            'graph-access-token', target_email='user+1@example.com',
+        )
 
         self.assertEqual(code, 'ABC123')
         self.assertIn(
@@ -98,6 +105,155 @@ class EmailManagerGraphTest(unittest.TestCase):
             get.call_args.args[0],
         )
         self.assertNotIn('outlook.office.com', get.call_args.args[0])
+        self.assertIn('toRecipients', get.call_args.args[0])
+
+    @patch('core.email_manager.requests.get')
+    def test_graph_selects_exact_alias_in_shared_mailbox(self, get):
+        now = datetime.now(timezone.utc)
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {
+            'value': [
+                {
+                    'id': 'wrong-newer',
+                    'subject': 'Your Grok confirmation code',
+                    'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+                    'toRecipients': [{
+                        'emailAddress': {'address': 'user+2@example.com'},
+                    }],
+                    'receivedDateTime': now.isoformat(),
+                    'bodyPreview': 'WRG-222 confirmation code',
+                    'body': {'contentType': 'text', 'content': 'WRG-222 confirmation code'},
+                },
+                {
+                    'id': 'target-older',
+                    'subject': 'Your Grok confirmation code',
+                    'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+                    'toRecipients': [{
+                        'emailAddress': {'address': 'user+1@example.com'},
+                    }],
+                    'receivedDateTime': (now - timedelta(seconds=2)).isoformat(),
+                    'bodyPreview': 'OKA-111 confirmation code',
+                    'body': {'contentType': 'text', 'content': 'OKA-111 confirmation code'},
+                },
+            ],
+        }
+        get.return_value = response
+
+        code = self.manager._graph_get_code(
+            'graph-access-token',
+            target_email='user+1@example.com',
+            main_email='user@example.com',
+            received_after=now - timedelta(seconds=10),
+        )
+
+        self.assertEqual(code, 'OKA111')
+
+    @patch('core.email_manager.requests.get')
+    def test_graph_rejects_messages_older_than_send_request(self, get):
+        now = datetime.now(timezone.utc)
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [{
+            'id': 'old-message',
+            'subject': 'Your Grok confirmation code',
+            'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+            'toRecipients': [{
+                'emailAddress': {'address': 'user+1@example.com'},
+            }],
+            'receivedDateTime': (now - timedelta(minutes=2)).isoformat(),
+            'bodyPreview': 'OLD-111 confirmation code',
+            'body': {'contentType': 'text', 'content': 'OLD-111 confirmation code'},
+        }]}
+        get.return_value = response
+
+        code = self.manager._graph_get_code(
+            'graph-access-token',
+            target_email='user+1@example.com',
+            received_after=now - timedelta(seconds=10),
+        )
+
+        self.assertIsNone(code)
+
+    @patch('core.email_manager.requests.get')
+    def test_graph_does_not_guess_between_ambiguous_new_messages(self, get):
+        now = datetime.now(timezone.utc).isoformat()
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [
+            {
+                'id': 'ambiguous-1',
+                'subject': 'Your Grok confirmation code',
+                'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+                'receivedDateTime': now,
+                'bodyPreview': 'AAA-111 confirmation code',
+                'body': {'contentType': 'text', 'content': 'AAA-111 confirmation code'},
+            },
+            {
+                'id': 'ambiguous-2',
+                'subject': 'Your Grok confirmation code',
+                'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+                'receivedDateTime': now,
+                'bodyPreview': 'BBB-222 confirmation code',
+                'body': {'contentType': 'text', 'content': 'BBB-222 confirmation code'},
+            },
+        ]}
+        get.return_value = response
+
+        code = self.manager._graph_get_code(
+            'graph-access-token', target_email='user+1@example.com',
+        )
+
+        self.assertIsNone(code)
+
+    @patch('core.email_manager.requests.get')
+    def test_graph_plus_alias_requires_exact_recipient_evidence(self, get):
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [{
+            'id': 'rewritten-to-main',
+            'subject': 'Your Grok confirmation code',
+            'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+            'toRecipients': [{
+                'emailAddress': {'address': 'user@example.com'},
+            }],
+            'receivedDateTime': datetime.now(timezone.utc).isoformat(),
+            'bodyPreview': 'BAD-111 confirmation code',
+            'body': {'contentType': 'text', 'content': 'BAD-111 confirmation code'},
+        }]}
+        get.return_value = response
+
+        code = self.manager._graph_get_code(
+            'graph-access-token',
+            target_email='user+1@example.com',
+            main_email='user@example.com',
+        )
+
+        self.assertIsNone(code)
+
+    @patch('core.email_manager.requests.get')
+    def test_graph_uses_original_recipient_header_for_plus_alias(self, get):
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [{
+            'id': 'original-recipient-header',
+            'subject': 'Your Grok confirmation code',
+            'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+            'toRecipients': [{
+                'emailAddress': {'address': 'user@example.com'},
+            }],
+            'internetMessageHeaders': [{
+                'name': 'X-Original-To',
+                'value': 'User Alias <user+1@example.com>',
+            }],
+            'receivedDateTime': datetime.now(timezone.utc).isoformat(),
+            'bodyPreview': 'HDR-111 confirmation code',
+            'body': {'contentType': 'text', 'content': 'HDR-111 confirmation code'},
+        }]}
+        get.return_value = response
+
+        code = self.manager._graph_get_code(
+            'graph-access-token',
+            target_email='user+1@example.com',
+            main_email='user@example.com',
+        )
+
+        self.assertEqual(code, 'HDR111')
 
     @patch('core.email_manager.requests.get')
     def test_graph_permission_denied_is_actionable(self, get):
@@ -122,6 +278,7 @@ class EmailManagerGraphTest(unittest.TestCase):
         response.json.return_value = {
             'value': [{
                 'Subject': 'Your Grok confirmation code',
+                'Id': 'outlook-message-1',
                 'From': {
                     'EmailAddress': {
                         'Name': 'xAI',
@@ -129,16 +286,125 @@ class EmailManagerGraphTest(unittest.TestCase):
                     },
                 },
                 'ReceivedDateTime': datetime.now(timezone.utc).isoformat(),
+                'ToRecipients': [{
+                    'EmailAddress': {'Address': 'user+1@example.com'},
+                }],
                 'BodyPreview': 'Use DEF-456 to confirm your email.',
                 'Body': {'ContentType': 'Text', 'Content': 'DEF-456'},
             }],
         }
         get.return_value = response
 
-        code = self.manager._outlook_get_code('opaque-outlook-token')
+        code = self.manager._outlook_get_code(
+            'opaque-outlook-token', target_email='user+1@example.com',
+        )
 
         self.assertEqual(code, 'DEF456')
         self.assertIn('outlook.office.com/api/v2.0', get.call_args.args[0])
+        self.assertIn('ToRecipients', get.call_args.args[0])
+
+    @patch('core.email_manager.requests.get')
+    def test_outlook_selects_exact_alias_in_shared_mailbox(self, get):
+        now = datetime.now(timezone.utc)
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [
+            {
+                'Id': 'wrong-outlook',
+                'Subject': 'Your Grok confirmation code',
+                'From': {'EmailAddress': {'Address': 'no-reply@x.ai'}},
+                'ToRecipients': [{
+                    'EmailAddress': {'Address': 'user+2@example.com'},
+                }],
+                'ReceivedDateTime': now.isoformat(),
+                'BodyPreview': 'WRG-333 confirmation code',
+                'Body': {'ContentType': 'Text', 'Content': 'WRG-333 confirmation code'},
+            },
+            {
+                'Id': 'target-outlook',
+                'Subject': 'Your Grok confirmation code',
+                'From': {'EmailAddress': {'Address': 'no-reply@x.ai'}},
+                'ToRecipients': [{
+                    'EmailAddress': {'Address': 'user+1@example.com'},
+                }],
+                'ReceivedDateTime': (now - timedelta(seconds=2)).isoformat(),
+                'BodyPreview': 'OUT-111 confirmation code',
+                'Body': {'ContentType': 'Text', 'Content': 'OUT-111 confirmation code'},
+            },
+        ]}
+        get.return_value = response
+
+        code = self.manager._outlook_get_code(
+            'opaque-outlook-token',
+            target_email='user+1@example.com',
+            main_email='user@example.com',
+            received_after=now - timedelta(seconds=10),
+        )
+
+        self.assertEqual(code, 'OUT111')
+
+    @patch('core.email_manager.requests.get')
+    def test_outlook_uses_original_recipient_header_for_plus_alias(self, get):
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [{
+            'Id': 'outlook-original-header',
+            'Subject': 'Your Grok confirmation code',
+            'From': {'EmailAddress': {'Address': 'no-reply@x.ai'}},
+            'ToRecipients': [{
+                'EmailAddress': {'Address': 'user@example.com'},
+            }],
+            'InternetMessageHeaders': [{
+                'Name': 'Delivered-To',
+                'Value': 'user+1@example.com',
+            }],
+            'ReceivedDateTime': datetime.now(timezone.utc).isoformat(),
+            'BodyPreview': 'LEG-111 confirmation code',
+            'Body': {'ContentType': 'Text', 'Content': 'LEG-111 confirmation code'},
+        }]}
+        get.return_value = response
+
+        code = self.manager._outlook_get_code(
+            'opaque-outlook-token',
+            target_email='user+1@example.com',
+            main_email='user@example.com',
+        )
+
+        self.assertEqual(code, 'LEG111')
+
+    @patch('core.email_manager.time.sleep')
+    @patch('core.email_manager.requests.get')
+    def test_get_verification_code_does_not_reuse_seen_message(self, get, sleep):
+        now = datetime.now(timezone.utc)
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'value': [{
+            'id': 'already-consumed',
+            'subject': 'Your Grok confirmation code',
+            'from': {'emailAddress': {'address': 'no-reply@x.ai'}},
+            'toRecipients': [{
+                'emailAddress': {'address': 'user+1@example.com'},
+            }],
+            'receivedDateTime': now.isoformat(),
+            'bodyPreview': 'USE-111 confirmation code',
+            'body': {'contentType': 'text', 'content': 'USE-111 confirmation code'},
+        }]}
+        get.return_value = response
+        self.manager.refresh_token = Mock(
+            return_value=('refresh-token', 'graph-access-token', 'graph'),
+        )
+
+        first = self.manager.get_verification_code(
+            'user+1@example.com', 'client-id', 'refresh-token',
+            max_retries=1, account_id=9, main_email='user@example.com',
+            requested_after=now - timedelta(seconds=5),
+        )
+        self.assertEqual(first, 'USE111')
+
+        with self.assertRaisesRegex(EmailError, 'Failed to get verification code'):
+            self.manager.get_verification_code(
+                'user+1@example.com', 'client-id', 'refresh-token',
+                max_retries=1, account_id=9, main_email='user@example.com',
+                requested_after=now - timedelta(seconds=5),
+            )
+        self.assertEqual(sleep.call_count, 2)
 
     @patch('core.email_manager.requests.get')
     def test_detects_legacy_outlook_token_audience(self, get):
@@ -177,9 +443,13 @@ class EmailManagerGraphTest(unittest.TestCase):
                 main_email='user@example.com',
             )
 
-        self.manager._graph_get_code.assert_called_once_with(
-            'graph-access-token'
-        )
+        self.manager._graph_get_code.assert_called_once()
+        call = self.manager._graph_get_code.call_args
+        self.assertEqual(call.args[0], 'graph-access-token')
+        self.assertEqual(call.kwargs['target_email'], 'user+1@example.com')
+        self.assertEqual(call.kwargs['main_email'], 'user@example.com')
+        self.assertIsInstance(call.kwargs['received_after'], datetime)
+        self.assertIsInstance(call.kwargs['seen_message_ids'], set)
         sleep.assert_called_once_with(8)
 
 

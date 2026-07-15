@@ -5,6 +5,7 @@ import string
 import random
 import secrets
 import re
+from datetime import datetime, timezone
 
 from DrissionPage.errors import PageDisconnectedError
 from config import SIGNUP_URL
@@ -259,7 +260,7 @@ class RegistrationEngine:
             # 2. Fill email
             self.state.check_pause()
             logger.info(f"Filling email: {alias_email}")
-            self._fill_email(alias_email)
+            verification_requested_at = self._fill_email(alias_email)
 
             # 3. Get verification code
             self.state.check_pause()
@@ -268,7 +269,8 @@ class RegistrationEngine:
                 alias_email, alias['account_id'],
                 alias['client_id'], alias['refresh_token'],
                 max_retries=int(settings.get('max_code_retries', 3)),
-                main_email=alias.get('main_email')
+                main_email=alias.get('main_email'),
+                requested_after=verification_requested_at,
             )
 
             # 4. Fill code and confirm
@@ -610,6 +612,7 @@ return {clicked: true, label: (target.innerText || target.textContent || '').rep
                         )
                     if submit:
                         with email_request_slot():
+                            requested_at = datetime.now(timezone.utc)
                             submit.click()
                             logger.info(
                                 'Filled email and clicked submit natively (%s): %s',
@@ -617,7 +620,7 @@ return {clicked: true, label: (target.innerText || target.textContent || '').rep
                                 email_addr,
                             )
                             self._wait_for_verification_request(email_addr)
-                        return
+                        return requested_at
             except VerificationRequestError:
                 raise
             except Exception as exc:
@@ -670,6 +673,7 @@ return String(input.value || '').trim().length >= 50 ? 'ready' : 'pending';
                         self._solve_turnstile()
                     # Click submit/register button
                     with email_request_slot():
+                        requested_at = datetime.now(timezone.utc)
                         clicked = self.browser.run_js(r"""
 function isVisible(node) {
     if (!node) return false;
@@ -728,13 +732,13 @@ return {ok:true, label:(submitButton.innerText || submitButton.textContent || ''
                             email_addr,
                         )
                         self._wait_for_verification_request(email_addr)
-                        return
+                        return requested_at
                     if isinstance(clicked, dict) and clicked.get('labels'):
                         logger.debug('Email submit candidates: %s', clicked.get('labels'))
                     elif clicked is True:
                         logger.info(f"Filled email and clicked submit: {email_addr}")
                         self._wait_for_verification_request(email_addr)
-                        return
+                        return requested_at
 
             except VerificationRequestError:
                 raise
