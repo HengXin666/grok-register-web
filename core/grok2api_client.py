@@ -297,6 +297,20 @@ class Grok2APIClient:
             json_body={'ids': [account_id]},
         )
         if int(converted.get('failed', 0) or 0) > 0:
+            # Conversion can fail transiently after the Web record has already
+            # been imported (for example, a short upstream/network timeout).
+            # Retry once; grok2api's conversion is identity-aware and will
+            # return linked/skipped when the first attempt partially succeeded.
+            logger.warning(
+                'grok2api Build conversion reported failed=%s; retrying once: web_account_id=%s',
+                converted.get('failed', 0),
+                account_id,
+            )
+            converted = self._run_sse_task(
+                '/api/admin/v1/accounts/web/convert-to-build',
+                json_body={'ids': [account_id]},
+            )
+        if int(converted.get('failed', 0) or 0) > 0:
             raise Grok2APIError(
                 f'grok2api Build conversion failed for Web account {account_id}'
             )

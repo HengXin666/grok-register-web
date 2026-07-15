@@ -4,6 +4,7 @@
 FAILURE_CATEGORY_MAIL_FETCH = 'mail_fetch'
 FAILURE_CATEGORY_REGISTRATION = 'registration'
 FAILURE_CATEGORY_EXISTING_ACCOUNT = 'existing_account'
+FAILURE_CATEGORY_SSO_DUPLICATE = 'sso_duplicate'
 
 MAIL_FETCH_ERROR_MARKERS = (
     'failed to get verification code',
@@ -30,6 +31,8 @@ def classify_failure(error_msg: str) -> str:
         or 'an account already exists which is associated with this email address' in text
     ):
         return FAILURE_CATEGORY_EXISTING_ACCOUNT
+    if 'duplicate sso' in (error_msg or '').lower() or '重复 sso' in (error_msg or '').lower():
+        return FAILURE_CATEGORY_SSO_DUPLICATE
     if is_mail_fetch_error(error_msg):
         return FAILURE_CATEGORY_MAIL_FETCH
     return FAILURE_CATEGORY_REGISTRATION

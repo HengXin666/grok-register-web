@@ -49,6 +49,10 @@ class ExistingAccountError(RuntimeError):
     """xAI reports that the email already belongs to an existing account."""
 
 
+class DuplicateSSOError(RuntimeError):
+    """The completed flow returned an SSO identity already seen locally."""
+
+
 class RegistrationState:
     def __init__(self):
         self._pause_event = threading.Event()
@@ -141,6 +145,26 @@ class RegistrationState:
             self._current_round += 1
             return self._current_round
 
+    def reserve_worker_round(self, worker_id, alias, max_rounds=0):
+        """Reserve a target slot and publish the worker atomically.
+
+        Retries that do not reach a terminal success/failure do not consume a
+        target slot, while concurrent workers cannot reserve beyond max_rounds.
+        """
+        with self._lock:
+            if max_rounds > 0 and self._completed + len(self._active_workers) >= max_rounds:
+                return None
+            self._current_round += 1
+            self._active_workers[worker_id] = {
+                'worker_id': worker_id,
+                'round': self._current_round,
+                'email': alias['alias_email'],
+                'account_id': alias['account_id'],
+                'alias_id': alias['id'],
+            }
+            self._legacy_current_email = ''
+            return self._current_round
+
     def set_worker_active(self, worker_id, round_number, alias):
         with self._lock:
             self._active_workers[worker_id] = {
@@ -156,15 +180,19 @@ class RegistrationState:
         with self._lock:
             self._active_workers.pop(worker_id, None)
 
-    def record_success(self):
+    def record_success(self, worker_id=None):
         with self._lock:
             self._success += 1
             self._completed += 1
+            if worker_id:
+                self._active_workers.pop(worker_id, None)
 
-    def record_failure(self):
+    def record_failure(self, worker_id=None):
         with self._lock:
             self._failed += 1
             self._completed += 1
+            if worker_id:
+                self._active_workers.pop(worker_id, None)
 
     def pause(self):
         self._pause_event.clear()

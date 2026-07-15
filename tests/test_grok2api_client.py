@@ -96,13 +96,56 @@ class Grok2APIClientTest(unittest.TestCase):
             status_code=200,
             text='event: complete\ndata: {"created":0,"linked":0,"skipped":0,"failed":1}\n\n',
         )
-        session.post.side_effect = [login_one, imported, login_two, converted]
+        login_three = Mock(status_code=200)
+        login_three.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        converted_retry = Mock(
+            status_code=200,
+            text='event: complete\ndata: {"created":0,"linked":0,"skipped":0,"failed":1}\n\n',
+        )
+        session.post.side_effect = [
+            login_one, imported, login_two, converted,
+            login_three, converted_retry,
+        ]
         session.get.return_value = lookup
         client = Grok2APIClient('http://localhost:21434', 'admin', 'secret')
         client.session = session
 
         with self.assertRaisesRegex(Grok2APIError, 'failed for Web account 42'):
             client.import_web_sso_and_convert('sso-token', email='user@example.com')
+
+    def test_web_sso_conversion_retries_one_transient_failure(self):
+        session = Mock()
+        login_one = Mock(status_code=200)
+        login_one.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        imported = Mock(status_code=200, text='event: complete\ndata: {"created":1,"updated":0}\n\n')
+        lookup = Mock(status_code=200)
+        lookup.json.return_value = {
+            'data': {'items': [{'id': '42', 'name': 'user@example.com'}]},
+        }
+        login_two = Mock(status_code=200)
+        login_two.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        first_conversion = Mock(
+            status_code=200,
+            text='event: complete\ndata: {"created":0,"linked":0,"skipped":0,"failed":1}\n\n',
+        )
+        login_three = Mock(status_code=200)
+        login_three.json.return_value = {'data': {'tokens': {'accessToken': 'admin-token'}}}
+        successful_retry = Mock(
+            status_code=200,
+            text='event: complete\ndata: {"created":0,"linked":1,"skipped":0,"failed":0}\n\n',
+        )
+        session.post.side_effect = [
+            login_one, imported, login_two, first_conversion,
+            login_three, successful_retry,
+        ]
+        session.get.return_value = lookup
+        client = Grok2APIClient('http://localhost:21434', 'admin', 'secret')
+        client.session = session
+
+        result = client.import_web_sso_and_convert('sso-token', email='user@example.com')
+
+        self.assertEqual(result['conversion']['linked'], 1)
+        self.assertEqual(session.post.call_count, 6)
 
 
 if __name__ == '__main__':

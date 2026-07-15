@@ -11,9 +11,16 @@ from urllib.parse import urlparse
 from DrissionPage.errors import PageDisconnectedError
 from config import SIGNUP_URL
 from core.grok2api_client import upload_registered_sso
-from core.account_activation import activate_grok_web
+from core.account_activation import (
+    CloudflareContext,
+    activate_grok_web,
+    capture_cloudflare_context,
+    clear_sso_cookies,
+    restore_cloudflare_context,
+)
 from core.registration.state import (
     EMAIL_REQUEST_MIN_INTERVAL,
+    DuplicateSSOError,
     ExistingAccountError,
     RegistrationState,
     VerificationRequestError,
@@ -37,6 +44,8 @@ from core.runtime import resolve_browser_headless, resolve_registration_concurre
 
 logger = logging.getLogger('register')
 
+MIN_VERIFICATION_CODE_POLLS = 10
+
 
 class RegistrationEngine:
     def __init__(self, db, browser_mgr, email_mgr, socketio, state):
@@ -46,6 +55,9 @@ class RegistrationEngine:
         self.socketio = socketio
         self.state = state
         self._cookie_banner_dismissed = False
+        # Kept per registration worker so a successful first challenge can be
+        # reused after tab/profile recycling on the same egress.
+        self._cloudflare_context = None
 
     def run(self, max_rounds=0, max_retries=3, concurrency=1):
         self.state.status = 'running'
@@ -134,12 +146,13 @@ class RegistrationEngine:
                     break
                 claimed_any.set()
 
-                round_num = self.state.reserve_round(max_rounds)
+                round_num = self.state.reserve_worker_round(
+                    worker_id, alias, max_rounds,
+                )
                 if round_num is None:
                     self.db.release_alias_claim(alias['id'], lease_owner)
                     break
 
-                self.state.set_worker_active(worker_id, round_num, alias)
                 self._emit_status()
                 heartbeat_stop = threading.Event()
                 heartbeat = threading.Thread(
@@ -212,18 +225,62 @@ class RegistrationEngine:
             logger.warning(f"Refresh page failed: {e}, restarting browser")
             self.browser.start()
 
-    def _restart_browser(self, force_close=False):
-        """Clear cookies/cache, optionally close and reopen browser."""
+    def _capture_cloudflare_context(self, page=None):
+        page = page or self.browser.page
         try:
-            page = self.browser.page
+            context = capture_cloudflare_context(page)
+        except Exception as exc:
+            logger.debug('Could not capture registration Cloudflare context: %s', exc)
+            return self._cloudflare_context
+        if context.ready:
+            self._cloudflare_context = context
+            logger.info('Captured reusable grok.com Cloudflare context from registration browser')
+        return self._cloudflare_context
+
+    def _restore_cloudflare_context(self, page=None):
+        if not self._cloudflare_context or not self._cloudflare_context.ready:
+            return False
+        page = page or self.browser.page
+        try:
+            restored = restore_cloudflare_context(page, self._cloudflare_context)
+            if restored:
+                logger.info('Restored grok.com Cloudflare context into registration browser')
+            return restored
+        except Exception as exc:
+            logger.debug('Could not restore registration Cloudflare context: %s', exc)
+            return False
+
+    def _restart_browser(self, force_close=False, preserve_cloudflare=True):
+        """Recycle the page while retaining a valid grok.com trust context."""
+        page = self.browser.page
+        context = self._capture_cloudflare_context(page) if preserve_cloudflare else None
+        keep_cloudflare = bool(context and context.ready)
+        try:
             if page:
-                page.run_cdp('Network.clearBrowserCookies')
-                page.run_cdp('Network.clearBrowserCache')
-                for origin in ['https://accounts.x.ai', 'https://grok.com', 'https://auth.x.ai', 'https://x.ai']:
-                    try:
-                        page.run_cdp('Storage.clearDataForOrigin', origin=origin, storageTypes='all')
-                    except Exception:
-                        pass
+                if keep_cloudflare:
+                    # Capture the reusable CF context first, then clear the
+                    # entire browser cookie/cache jar. Selective cookie deletion
+                    # can miss host-only xAI cookies and cause stale SSO reuse.
+                    page.run_cdp('Network.clearBrowserCookies')
+                    page.run_cdp('Network.clearBrowserCache')
+                    for origin in ['https://accounts.x.ai', 'https://auth.x.ai', 'https://x.ai']:
+                        try:
+                            page.run_cdp(
+                                'Storage.clearDataForOrigin',
+                                origin=origin,
+                                storageTypes='all',
+                            )
+                        except Exception:
+                            pass
+                    logger.info('Preserving grok.com Cloudflare context while recycling browser')
+                else:
+                    page.run_cdp('Network.clearBrowserCookies')
+                    page.run_cdp('Network.clearBrowserCache')
+                    for origin in ['https://accounts.x.ai', 'https://grok.com', 'https://auth.x.ai', 'https://x.ai']:
+                        try:
+                            page.run_cdp('Storage.clearDataForOrigin', origin=origin, storageTypes='all')
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -234,6 +291,7 @@ class RegistrationEngine:
                 pass
             time.sleep(1.5)
             self.browser.start()
+            self._restore_cloudflare_context()
             self._cookie_banner_dismissed = False
             logger.info("Browser restarted (force close)")
         else:
@@ -246,6 +304,7 @@ class RegistrationEngine:
                     except Exception:
                         pass
                     self.browser._page = new_page
+                    self._restore_cloudflare_context(new_page)
                     self._cookie_banner_dismissed = False
             except Exception:
                 pass
@@ -287,7 +346,10 @@ class RegistrationEngine:
             code = self.email_mgr.get_code_for_alias(
                 alias_email, alias['account_id'],
                 alias['client_id'], alias['refresh_token'],
-                max_retries=int(settings.get('max_code_retries', 3)),
+                max_retries=max(
+                    MIN_VERIFICATION_CODE_POLLS,
+                    int(settings.get('max_code_retries', 3) or 3),
+                ),
                 main_email=alias.get('main_email'),
                 requested_after=verification_requested_at,
             )
@@ -306,6 +368,19 @@ class RegistrationEngine:
             logger.info("Extracting SSO token...")
             sso = self._extract_sso()
 
+            duplicate = self.db.find_existing_sso(sso)
+            if duplicate:
+                fingerprint = duplicate.get('fingerprint', '')[:12]
+                raise DuplicateSSOError(
+                    f'Duplicate SSO identity detected (sha256={fingerprint}, '
+                    f'previous={duplicate.get("email", "unknown")})'
+                )
+
+            # The signup redirect may already have established grok.com
+            # clearance. Capture it before activation/navigation changes the
+            # page, then keep it for subsequent aliases on this worker.
+            self._capture_cloudflare_context()
+
             # Once SSO is obtained, registration is successful.
             # Web activation / CF challenge must NEVER fail the whole round —
             # otherwise we lose a good account and skip grok2api upload.
@@ -317,7 +392,13 @@ class RegistrationEngine:
                         self.browser,
                         sso,
                         proxy_url=(settings.get('browser_proxy', '') or '').strip(),
+                        cloudflare_context=self._cloudflare_context,
                     )
+                    if activation and activation.cloudflare_cookies:
+                        self._cloudflare_context = CloudflareContext(
+                            user_agent=activation.user_agent,
+                            cloudflare_cookies=activation.cloudflare_cookies,
+                        )
                     if activation and activation.ready:
                         logger.info(f'Grok Web activation completed: {activation.message}')
                     else:
@@ -335,39 +416,52 @@ class RegistrationEngine:
 
             # 9. Save results — SSO already in hand, mark success first
             duration = time.time() - start_time
+            grok2api_enabled = settings.get('grok2api_auto_upload', 'false') == 'true'
             completion = self.db.complete_registration_success(
                 reg_id, alias['id'], lease_owner, sso, duration=duration,
+                grok2api_pending=grok2api_enabled,
             )
             success_committed = True
 
-            try:
-                upload_result = upload_registered_sso(
-                    settings, sso, email=alias_email,
-                    user_agent=activation.user_agent if activation else '',
-                    cloudflare_cookies=activation.cloudflare_cookies if activation else '',
-                )
-                if upload_result is not None:
-                    imported = upload_result.get('import', {})
-                    converted = upload_result.get('conversion', {})
-                    logger.info(
-                        'grok2api auto pipeline completed: web_created=%s web_updated=%s '
-                        'web_synced=%s web_sync_failed=%s build_created=%s linked=%s '
-                        'skipped=%s failed=%s build_synced=%s build_sync_failed=%s',
-                        imported.get('created', 0),
-                        imported.get('updated', 0),
-                        imported.get('synced', 0),
-                        imported.get('syncFailed', 0),
-                        converted.get('created', 0),
-                        converted.get('linked', 0),
-                        converted.get('skipped', 0),
-                        converted.get('failed', 0),
-                        converted.get('synced', 0),
-                        converted.get('syncFailed', 0),
+            if grok2api_enabled:
+                self.db.begin_grok2api_upload(reg_id)
+                try:
+                    upload_context = self._cloudflare_context
+                    upload_result = upload_registered_sso(
+                        settings, sso, email=alias_email,
+                        user_agent=(
+                            activation.user_agent if activation and activation.user_agent
+                            else upload_context.user_agent if upload_context else ''
+                        ),
+                        cloudflare_cookies=(
+                            activation.cloudflare_cookies if activation and activation.cloudflare_cookies
+                            else upload_context.cloudflare_cookies if upload_context else ''
+                        ),
                     )
-            except Exception as upload_error:
-                logger.warning(f'grok2api auto upload failed: {upload_error}')
+                    self.db.finish_grok2api_upload(reg_id, True)
+                    if upload_result is not None:
+                        imported = upload_result.get('import', {})
+                        converted = upload_result.get('conversion', {})
+                        logger.info(
+                            'grok2api auto pipeline completed: web_created=%s web_updated=%s '
+                            'web_synced=%s web_sync_failed=%s build_created=%s linked=%s '
+                            'skipped=%s failed=%s build_synced=%s build_sync_failed=%s',
+                            imported.get('created', 0),
+                            imported.get('updated', 0),
+                            imported.get('synced', 0),
+                            imported.get('syncFailed', 0),
+                            converted.get('created', 0),
+                            converted.get('linked', 0),
+                            converted.get('skipped', 0),
+                            converted.get('failed', 0),
+                            converted.get('synced', 0),
+                            converted.get('syncFailed', 0),
+                        )
+                except Exception as upload_error:
+                    self.db.finish_grok2api_upload(reg_id, False, upload_error)
+                    logger.warning(f'grok2api auto upload failed: {upload_error}')
 
-            self.state.record_success()
+            self.state.record_success(worker_id)
             logger.info(f"Round {round_num} SUCCESS! Duration: {duration:.1f}s")
 
             self.socketio.emit('round_complete', {
@@ -438,7 +532,7 @@ class RegistrationEngine:
                     error=error_msg,
                     duration=duration,
                 )
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 if outcome['lease_lost']:
                     logger.warning(
                         'Existing account %s detected, but alias lease was lost before skip commit',
@@ -470,6 +564,34 @@ class RegistrationEngine:
                     except Exception:
                         pass
                 return
+            if isinstance(e, DuplicateSSOError):
+                # A stale browser identity is recoverable. Count one special
+                # retry, force-close the browser, and let claim_next_alias()
+                # reclaim this same alias once more even when normal retries=1.
+                duplicate_limit = max_retries + 1
+                outcome = self.db.finish_registration_attempt(
+                    reg_id=reg_id,
+                    alias_id=alias['id'],
+                    lease_owner=lease_owner,
+                    error=error_msg,
+                    duration=duration,
+                    max_retries=duplicate_limit,
+                )
+                logger.warning(
+                    'Round %s returned a duplicate SSO; retry=%s terminal=%s',
+                    round_num,
+                    outcome.get('retry_count', 0),
+                    outcome.get('terminal', False),
+                )
+                if outcome.get('terminal'):
+                    self.state.record_failure(worker_id)
+                self._emit_status()
+                if not self.state.should_stop():
+                    try:
+                        self._restart_browser(force_close=True)
+                    except Exception:
+                        pass
+                return
             if isinstance(e, VerificationRequestError) and is_xai_permission_denied(e):
                 released = self.db.abort_registration_attempt(
                     reg_id=reg_id,
@@ -478,7 +600,7 @@ class RegistrationEngine:
                     error=error_msg,
                     duration=duration,
                 )
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 self.state.stop()
                 logger.error(
                     'Round %s stopped by xAI permission_denied 403; alias %s '
@@ -509,7 +631,7 @@ class RegistrationEngine:
             if outcome['lease_lost']:
                 logger.warning('Alias %s lease was lost before failure commit', alias['id'])
             elif outcome['terminal']:
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 logger.info(f"Alias {alias_email} exhausted {max_retries} retries, marked failed")
                 if outcome['account_disabled']:
                     logger.warning(

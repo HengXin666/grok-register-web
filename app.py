@@ -15,6 +15,7 @@ from core.browser import BrowserManager, redact_proxy_url
 from core.email_manager import EmailManager
 from core.runtime import resolve_browser_headless
 from core.oauth import OAuthManager
+from core.grok2api_retry import Grok2APIRetryWorker
 from core.web_security import is_loopback_host, origin_matches_host
 from api.accounts import init_accounts_api
 from api.register import init_register_api
@@ -51,6 +52,7 @@ browser_mgr = BrowserManager(
 )
 email_mgr = EmailManager(db)
 oauth_mgr = OAuthManager(db)
+grok2api_retry_worker = Grok2APIRetryWorker(db)
 
 # ── Register API Blueprints ────────────────────────────────
 app.register_blueprint(init_accounts_api(db, oauth_mgr))
@@ -95,6 +97,7 @@ def main():
 
     # Initialize database
     db.init_database()
+    grok2api_retry_worker.start()
 
     # Recover stale registrations
     settings = db.get_settings()

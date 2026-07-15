@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import core.database as database_module
 from core.database import Database
 from core.register import RegistrationEngine, RegistrationState
+from core.registration.state import DuplicateSSOError
 
 
 class ConcurrentAliasClaimTest(unittest.TestCase):
@@ -227,8 +228,89 @@ class ConcurrentAliasClaimTest(unittest.TestCase):
         self.assertNotEqual(next_alias['id'], alias['id'])
         self.assertEqual(next_alias['alias_index'], 1)
 
+    def test_duplicate_sso_is_detected_and_reclaimable_once(self):
+        self._add_accounts(1)
+        first = self.db.claim_next_alias(1, 'worker-1', lease_seconds=60)
+        first_reg = self.db.create_registration(
+            first['id'], first['alias_email'], 'password', 1,
+            lease_owner='worker-1',
+        )
+        self.db.complete_registration_success(
+            first_reg, first['id'], 'worker-1', 'same-sso', 1.0,
+        )
+
+        self.assertEqual(
+            self.db.find_existing_sso('same-sso')['email'],
+            first['alias_email'],
+        )
+
+        second = self.db.claim_next_alias(1, 'worker-2', lease_seconds=60)
+        second_reg = self.db.create_registration(
+            second['id'], second['alias_email'], 'password', 2,
+            lease_owner='worker-2',
+        )
+        outcome = self.db.finish_registration_attempt(
+            second_reg, second['id'], 'worker-2',
+            'Duplicate SSO identity detected (sha256=abc)', 1.0, 2,
+        )
+        self.assertFalse(outcome['terminal'])
+
+        row = self.db.conn.execute(
+            'SELECT status, retry_count, failure_category FROM aliases WHERE id=?',
+            (second['id'],),
+        ).fetchone()
+        self.assertEqual(row['status'], 'ready')
+        self.assertEqual(row['retry_count'], 1)
+        self.assertEqual(row['failure_category'], 'sso_duplicate')
+
+        reclaimed = self.db.claim_next_alias(1, 'worker-3', lease_seconds=60)
+        self.assertEqual(reclaimed['id'], second['id'])
+
+    def test_success_commit_rechecks_sso_atomically_and_ledger_survives_cleanup(self):
+        self._add_accounts(1)
+        first = self.db.claim_next_alias(3, 'worker-1', lease_seconds=60)
+        first_reg = self.db.create_registration(
+            first['id'], first['alias_email'], 'password', 1,
+            lease_owner='worker-1',
+        )
+        self.db.complete_registration_success(
+            first_reg, first['id'], 'worker-1', 'same-sso', 1.0,
+        )
+
+        second = self.db.claim_next_alias(3, 'worker-2', lease_seconds=60)
+        second_reg = self.db.create_registration(
+            second['id'], second['alias_email'], 'password', 2,
+            lease_owner='worker-2',
+        )
+        with self.assertRaises(DuplicateSSOError):
+            self.db.complete_registration_success(
+                second_reg, second['id'], 'worker-2', 'same-sso', 1.0,
+            )
+
+        self.db.delete_registrations([first_reg])
+        self.db.reset_account(first['account_id'])
+        self.assertIsNotNone(self.db.find_existing_sso('same-sso'))
+
 
 class RegistrationStateConcurrencyTest(unittest.TestCase):
+    def test_retry_does_not_consume_max_round_target(self):
+        state = RegistrationState()
+        alias = {
+            'id': 1,
+            'account_id': 1,
+            'alias_email': 'user@example.com',
+        }
+
+        first = state.reserve_worker_round('worker-1', alias, max_rounds=1)
+        self.assertEqual(first, 1)
+        state.clear_worker('worker-1')  # retryable duplicate/temporary failure
+        second = state.reserve_worker_round('worker-1', alias, max_rounds=1)
+        self.assertEqual(second, 2)
+        state.record_success('worker-1')
+        self.assertIsNone(
+            state.reserve_worker_round('worker-1', alias, max_rounds=1),
+        )
+
     def test_active_workers_and_counters_are_thread_safe(self):
         state = RegistrationState()
         worker_count = 8
