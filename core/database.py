@@ -582,6 +582,14 @@ class Database:
             self.conn.commit()
             return cur.rowcount == 1
 
+    def get_alias_lease_state(self, alias_id):
+        """Return minimal alias state for distinguishing completion from lease loss."""
+        row = self.conn.execute(
+            'SELECT status, lease_owner FROM aliases WHERE id=?',
+            (alias_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def release_alias_claim(self, alias_id, lease_owner):
         with self._write_lock:
             cur = self.conn.execute(

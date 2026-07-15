@@ -178,6 +178,16 @@ class RegistrationEngine:
                 if not self.db.heartbeat_alias_lease(
                     alias_id, lease_owner, lease_seconds,
                 ):
+                    alias_state = self.db.get_alias_lease_state(alias_id) or {}
+                    if (
+                        alias_state.get('status') in ('used', 'failed')
+                        and not alias_state.get('lease_owner')
+                    ):
+                        logger.debug(
+                            'Alias %s lease ended after terminal completion',
+                            alias_id,
+                        )
+                        return
                     logger.warning('Alias %s lease was lost', alias_id)
                     return
             except Exception as exc:
