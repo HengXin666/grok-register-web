@@ -2,6 +2,7 @@
 
 from .state import (
     EMAIL_REQUEST_MIN_INTERVAL,
+    DuplicateSSOError,
     ExistingAccountError,
     RegistrationState,
     VerificationRequestError,
@@ -25,6 +26,7 @@ from .signup import (
 
 __all__ = [
     'EMAIL_REQUEST_MIN_INTERVAL',
+    'DuplicateSSOError',
     'ExistingAccountError',
     'RegistrationState',
     'VerificationRequestError',

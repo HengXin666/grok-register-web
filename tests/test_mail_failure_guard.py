@@ -48,6 +48,9 @@ class AliasBudgetLogicTest(unittest.TestCase):
             database_module.DEFAULT_SETTINGS['registration_concurrency'], '1',
         )
 
+    def test_verification_poll_setting_has_safe_minimum(self):
+        self.assertEqual(database_module.DEFAULT_SETTINGS['max_code_retries'], '10')
+
 
 class LegacyAliasMigrationTest(unittest.TestCase):
     def test_adds_and_backfills_terminal_metadata(self):

@@ -20,6 +20,7 @@ from core.account_activation import (
 )
 from core.registration.state import (
     EMAIL_REQUEST_MIN_INTERVAL,
+    DuplicateSSOError,
     ExistingAccountError,
     RegistrationState,
     VerificationRequestError,
@@ -44,10 +45,6 @@ from core.runtime import resolve_browser_headless, resolve_registration_concurre
 logger = logging.getLogger('register')
 
 MIN_VERIFICATION_CODE_POLLS = 10
-
-
-class DuplicateSSOError(RuntimeError):
-    """The newly completed flow returned an SSO identity already seen locally."""
 
 
 class RegistrationEngine:
@@ -149,12 +146,13 @@ class RegistrationEngine:
                     break
                 claimed_any.set()
 
-                round_num = self.state.reserve_round(max_rounds)
+                round_num = self.state.reserve_worker_round(
+                    worker_id, alias, max_rounds,
+                )
                 if round_num is None:
                     self.db.release_alias_claim(alias['id'], lease_owner)
                     break
 
-                self.state.set_worker_active(worker_id, round_num, alias)
                 self._emit_status()
                 heartbeat_stop = threading.Event()
                 heartbeat = threading.Thread(
@@ -418,46 +416,52 @@ class RegistrationEngine:
 
             # 9. Save results — SSO already in hand, mark success first
             duration = time.time() - start_time
+            grok2api_enabled = settings.get('grok2api_auto_upload', 'false') == 'true'
             completion = self.db.complete_registration_success(
                 reg_id, alias['id'], lease_owner, sso, duration=duration,
+                grok2api_pending=grok2api_enabled,
             )
             success_committed = True
 
-            try:
-                upload_context = self._cloudflare_context
-                upload_result = upload_registered_sso(
-                    settings, sso, email=alias_email,
-                    user_agent=(
-                        activation.user_agent if activation and activation.user_agent
-                        else upload_context.user_agent if upload_context else ''
-                    ),
-                    cloudflare_cookies=(
-                        activation.cloudflare_cookies if activation and activation.cloudflare_cookies
-                        else upload_context.cloudflare_cookies if upload_context else ''
-                    ),
-                )
-                if upload_result is not None:
-                    imported = upload_result.get('import', {})
-                    converted = upload_result.get('conversion', {})
-                    logger.info(
-                        'grok2api auto pipeline completed: web_created=%s web_updated=%s '
-                        'web_synced=%s web_sync_failed=%s build_created=%s linked=%s '
-                        'skipped=%s failed=%s build_synced=%s build_sync_failed=%s',
-                        imported.get('created', 0),
-                        imported.get('updated', 0),
-                        imported.get('synced', 0),
-                        imported.get('syncFailed', 0),
-                        converted.get('created', 0),
-                        converted.get('linked', 0),
-                        converted.get('skipped', 0),
-                        converted.get('failed', 0),
-                        converted.get('synced', 0),
-                        converted.get('syncFailed', 0),
+            if grok2api_enabled:
+                self.db.begin_grok2api_upload(reg_id)
+                try:
+                    upload_context = self._cloudflare_context
+                    upload_result = upload_registered_sso(
+                        settings, sso, email=alias_email,
+                        user_agent=(
+                            activation.user_agent if activation and activation.user_agent
+                            else upload_context.user_agent if upload_context else ''
+                        ),
+                        cloudflare_cookies=(
+                            activation.cloudflare_cookies if activation and activation.cloudflare_cookies
+                            else upload_context.cloudflare_cookies if upload_context else ''
+                        ),
                     )
-            except Exception as upload_error:
-                logger.warning(f'grok2api auto upload failed: {upload_error}')
+                    self.db.finish_grok2api_upload(reg_id, True)
+                    if upload_result is not None:
+                        imported = upload_result.get('import', {})
+                        converted = upload_result.get('conversion', {})
+                        logger.info(
+                            'grok2api auto pipeline completed: web_created=%s web_updated=%s '
+                            'web_synced=%s web_sync_failed=%s build_created=%s linked=%s '
+                            'skipped=%s failed=%s build_synced=%s build_sync_failed=%s',
+                            imported.get('created', 0),
+                            imported.get('updated', 0),
+                            imported.get('synced', 0),
+                            imported.get('syncFailed', 0),
+                            converted.get('created', 0),
+                            converted.get('linked', 0),
+                            converted.get('skipped', 0),
+                            converted.get('failed', 0),
+                            converted.get('synced', 0),
+                            converted.get('syncFailed', 0),
+                        )
+                except Exception as upload_error:
+                    self.db.finish_grok2api_upload(reg_id, False, upload_error)
+                    logger.warning(f'grok2api auto upload failed: {upload_error}')
 
-            self.state.record_success()
+            self.state.record_success(worker_id)
             logger.info(f"Round {round_num} SUCCESS! Duration: {duration:.1f}s")
 
             self.socketio.emit('round_complete', {
@@ -528,7 +532,7 @@ class RegistrationEngine:
                     error=error_msg,
                     duration=duration,
                 )
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 if outcome['lease_lost']:
                     logger.warning(
                         'Existing account %s detected, but alias lease was lost before skip commit',
@@ -579,6 +583,8 @@ class RegistrationEngine:
                     outcome.get('retry_count', 0),
                     outcome.get('terminal', False),
                 )
+                if outcome.get('terminal'):
+                    self.state.record_failure(worker_id)
                 self._emit_status()
                 if not self.state.should_stop():
                     try:
@@ -594,7 +600,7 @@ class RegistrationEngine:
                     error=error_msg,
                     duration=duration,
                 )
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 self.state.stop()
                 logger.error(
                     'Round %s stopped by xAI permission_denied 403; alias %s '
@@ -625,7 +631,7 @@ class RegistrationEngine:
             if outcome['lease_lost']:
                 logger.warning('Alias %s lease was lost before failure commit', alias['id'])
             elif outcome['terminal']:
-                self.state.record_failure()
+                self.state.record_failure(worker_id)
                 logger.info(f"Alias {alias_email} exhausted {max_retries} retries, marked failed")
                 if outcome['account_disabled']:
                     logger.warning(

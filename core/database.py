@@ -11,6 +11,7 @@ from core.failure_policy import (
     account_disable_reason,
     classify_failure,
 )
+from core.registration.state import DuplicateSSOError
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ DEFAULT_SETTINGS = {
 
 DEPRECATED_SETTING_KEYS = ('email_provider',)
 MAX_ALIASES_SETTING_KEY = 'max_aliases_per_account'
+MAX_CODE_RETRIES_SETTING_KEY = 'max_code_retries'
+MIN_CODE_RETRIES = 10
 
 
 class Database:
@@ -113,6 +116,10 @@ class Database:
                     error_message TEXT DEFAULT '',
                     duration_seconds REAL DEFAULT 0,
                     round_number INTEGER DEFAULT 0,
+                    grok2api_status TEXT DEFAULT '',
+                    grok2api_error TEXT DEFAULT '',
+                    grok2api_attempts INTEGER DEFAULT 0,
+                    grok2api_updated_at DATETIME,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -120,6 +127,14 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS sso_identities (
+                    fingerprint TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    registration_id INTEGER,
+                    alias_id INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_alias_account_index
@@ -134,6 +149,8 @@ class Database:
                     ON registrations(created_at);
             ''')
             self._migrate_alias_terminal_metadata(cur)
+            self._migrate_registration_delivery_metadata(cur)
+            self._backfill_sso_identities(cur)
             cur.execute(
                 '''CREATE UNIQUE INDEX IF NOT EXISTS idx_aliases_active_account
                    ON aliases(account_id) WHERE status = 'processing' '''
@@ -143,10 +160,23 @@ class Database:
                    ON aliases(status, lease_expires_at)'''
             )
             for key, value in DEFAULT_SETTINGS.items():
+                if key == MAX_CODE_RETRIES_SETTING_KEY:
+                    value = str(self._parse_code_retries(value))
                 cur.execute(
                     'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
                     (key, value)
                 )
+            stored_code_retries = cur.execute(
+                'SELECT value FROM settings WHERE key=?',
+                (MAX_CODE_RETRIES_SETTING_KEY,),
+            ).fetchone()
+            normalized_code_retries = self._parse_code_retries(
+                stored_code_retries['value'] if stored_code_retries else MIN_CODE_RETRIES
+            )
+            cur.execute(
+                'UPDATE settings SET value=?, updated_at=CURRENT_TIMESTAMP WHERE key=?',
+                (str(normalized_code_retries), MAX_CODE_RETRIES_SETTING_KEY),
+            )
             self._remove_deprecated_settings(cur)
             max_aliases = self._get_max_aliases_setting_locked(cur)
             self._sync_account_alias_limits_locked(cur, max_aliases)
@@ -169,6 +199,16 @@ class Database:
         if max_aliases < 1:
             raise ValueError('max_aliases_per_account must be a positive integer')
         return max_aliases
+
+    @staticmethod
+    def _parse_code_retries(value):
+        try:
+            retries = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError('max_code_retries must be an integer') from exc
+        if retries < MIN_CODE_RETRIES:
+            return MIN_CODE_RETRIES
+        return retries
 
     @classmethod
     def _get_max_aliases_setting_locked(cls, cursor):
@@ -254,6 +294,66 @@ class Database:
                 '''UPDATE aliases SET failure_category=?, completed_at=?
                    WHERE id=?''',
                 (category, completed_at, row['id']),
+            )
+
+    @staticmethod
+    def _migrate_registration_delivery_metadata(cursor):
+        columns = {
+            row['name']
+            for row in cursor.execute('PRAGMA table_info(registrations)').fetchall()
+        }
+        additions = {
+            'grok2api_status': "TEXT DEFAULT ''",
+            'grok2api_error': "TEXT DEFAULT ''",
+            'grok2api_attempts': 'INTEGER DEFAULT 0',
+            'grok2api_updated_at': 'DATETIME',
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                cursor.execute(
+                    f'ALTER TABLE registrations ADD COLUMN {name} {definition}'
+                )
+
+    @staticmethod
+    def _sso_fingerprint(sso_value):
+        value = (sso_value or '').strip()
+        return hashlib.sha256(value.encode()).hexdigest() if value else ''
+
+    @classmethod
+    def _backfill_sso_identities(cls, cursor):
+        """Build a durable identity ledger independent of result/alias cleanup."""
+        rows = cursor.execute(
+            '''SELECT id, alias_id, email, sso_value, created_at
+               FROM registrations
+               WHERE status='success' AND sso_value != ''
+               ORDER BY id ASC'''
+        ).fetchall()
+        for row in rows:
+            cursor.execute(
+                '''INSERT OR IGNORE INTO sso_identities (
+                       fingerprint, email, registration_id, alias_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?)''',
+                (
+                    cls._sso_fingerprint(row['sso_value']),
+                    row['email'], row['id'], row['alias_id'], row['created_at'],
+                ),
+            )
+        rows = cursor.execute(
+            '''SELECT id, alias_email, sso_value, used_at, created_at
+               FROM aliases
+               WHERE status='used' AND sso_value != ''
+               ORDER BY id ASC'''
+        ).fetchall()
+        for row in rows:
+            cursor.execute(
+                '''INSERT OR IGNORE INTO sso_identities (
+                       fingerprint, email, alias_id, created_at
+                   ) VALUES (?, ?, ?, ?)''',
+                (
+                    cls._sso_fingerprint(row['sso_value']),
+                    row['alias_email'], row['id'],
+                    row['used_at'] or row['created_at'],
+                ),
             )
 
     # ── Accounts CRUD ──────────────────────────────────────────
@@ -961,8 +1061,12 @@ class Database:
             self.conn.commit()
 
     def complete_registration_success(self, reg_id, alias_id, lease_owner,
-                                      sso, duration=0):
+                                      sso, duration=0, grok2api_pending=False):
         """Atomically persist a successful registration and release its alias lease."""
+        sso = (sso or '').strip()
+        fingerprint = self._sso_fingerprint(sso)
+        if not fingerprint:
+            raise ValueError('SSO cookie is empty')
         with self._write_lock:
             cur = self.conn.cursor()
             try:
@@ -975,17 +1079,47 @@ class Database:
                 if not alias:
                     raise RuntimeError(f'Alias lease lost before success commit: {alias_id}')
 
+                duplicate = cur.execute(
+                    '''SELECT fingerprint, email, registration_id, alias_id
+                       FROM sso_identities WHERE fingerprint=?''',
+                    (fingerprint,),
+                ).fetchone()
+                if duplicate and (
+                    duplicate['registration_id'] != reg_id
+                    or duplicate['alias_id'] != alias_id
+                ):
+                    raise DuplicateSSOError(
+                        f'Duplicate SSO identity detected '
+                        f'(sha256={fingerprint[:12]}, previous={duplicate["email"]})'
+                    )
+
                 completed_at = datetime.now().isoformat()
                 cur.execute(
                     '''UPDATE registrations SET status='success', sso_value=?,
-                       error_message='', duration_seconds=? WHERE id=?''',
-                    (sso, duration, reg_id),
+                       error_message='', duration_seconds=?, grok2api_status=?,
+                       grok2api_error='', grok2api_updated_at=? WHERE id=?''',
+                    (
+                        sso, duration,
+                        'pending' if grok2api_pending else '',
+                        completed_at if grok2api_pending else None,
+                        reg_id,
+                    ),
                 )
                 cur.execute(
                     '''UPDATE aliases SET status='used', sso_value=?, error_reason='',
                        failure_category='', used_at=?, completed_at=?,
                        lease_owner='', lease_expires_at=NULL WHERE id=?''',
                     (sso, completed_at, completed_at, alias_id),
+                )
+                cur.execute(
+                    '''INSERT INTO sso_identities (
+                           fingerprint, email, registration_id, alias_id, created_at
+                       ) VALUES (?, (SELECT email FROM registrations WHERE id=?), ?, ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET
+                           email=excluded.email,
+                           registration_id=excluded.registration_id,
+                           alias_id=excluded.alias_id''',
+                    (fingerprint, reg_id, reg_id, alias_id, completed_at),
                 )
 
                 account_done = bool(cur.execute(
@@ -1006,11 +1140,91 @@ class Database:
                 self.conn.rollback()
                 raise
 
+    def begin_grok2api_upload(self, reg_id):
+        now = datetime.now().isoformat()
+        with self._write_lock:
+            cur = self.conn.execute(
+                '''UPDATE registrations
+                   SET grok2api_status='uploading',
+                       grok2api_attempts=COALESCE(grok2api_attempts, 0)+1,
+                       grok2api_error='', grok2api_updated_at=?
+                   WHERE id=? AND status='success' AND sso_value != '' ''',
+                (now, reg_id),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+
+    def finish_grok2api_upload(self, reg_id, success, error=''):
+        now = datetime.now().isoformat()
+        status = 'success' if success else 'failed'
+        with self._write_lock:
+            self.conn.execute(
+                '''UPDATE registrations
+                   SET grok2api_status=?, grok2api_error=?, grok2api_updated_at=?
+                   WHERE id=?''',
+                (status, '' if success else str(error or '')[:1000], now, reg_id),
+            )
+            self.conn.commit()
+
+    def claim_grok2api_retries(self, limit=20, retry_delay_seconds=30,
+                               stale_upload_seconds=300):
+        """Atomically claim durable grok2api deliveries ready for retry."""
+        now = datetime.now()
+        retry_cutoff = (now - timedelta(seconds=retry_delay_seconds)).isoformat()
+        stale_cutoff = (now - timedelta(seconds=stale_upload_seconds)).isoformat()
+        with self._write_lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('BEGIN IMMEDIATE')
+                rows = cur.execute(
+                    '''SELECT id, email, sso_value, grok2api_status,
+                              grok2api_attempts, grok2api_updated_at
+                       FROM registrations
+                       WHERE status='success' AND sso_value != '' AND (
+                           (grok2api_status IN ('pending', 'failed') AND
+                            (grok2api_updated_at IS NULL OR grok2api_updated_at <= ?))
+                           OR
+                           (grok2api_status='uploading' AND
+                            (grok2api_updated_at IS NULL OR grok2api_updated_at <= ?))
+                       )
+                       ORDER BY id ASC LIMIT ?''',
+                    (retry_cutoff, stale_cutoff, max(1, int(limit))),
+                ).fetchall()
+                claimed_at = datetime.now().isoformat()
+                for row in rows:
+                    cur.execute(
+                        '''UPDATE registrations
+                           SET grok2api_status='uploading',
+                               grok2api_attempts=COALESCE(grok2api_attempts, 0)+1,
+                               grok2api_error='', grok2api_updated_at=?
+                           WHERE id=?''',
+                        (claimed_at, row['id']),
+                    )
+                self.conn.commit()
+                return [dict(row) for row in rows]
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def find_existing_sso(self, sso_value):
         """Find a previously committed registration using the same SSO identity."""
         value = (sso_value or '').strip()
         if not value:
             return None
+        fingerprint = self._sso_fingerprint(value)
+        row = self.conn.execute(
+            '''SELECT fingerprint, email, registration_id, alias_id, created_at
+               FROM sso_identities WHERE fingerprint=?''',
+            (fingerprint,),
+        ).fetchone()
+        if row:
+            return {
+                'source': 'identity_ledger',
+                'id': row['registration_id'] or row['alias_id'],
+                'email': row['email'],
+                'created_at': row['created_at'],
+                'fingerprint': row['fingerprint'],
+            }
         row = self.conn.execute(
             '''SELECT id, email, created_at
                FROM registrations
@@ -1024,7 +1238,7 @@ class Database:
                 'id': row['id'],
                 'email': row['email'],
                 'created_at': row['created_at'],
-                'fingerprint': hashlib.sha256(value.encode()).hexdigest(),
+                'fingerprint': fingerprint,
             }
         row = self.conn.execute(
             '''SELECT id, alias_email, used_at
@@ -1039,7 +1253,7 @@ class Database:
                 'id': row['id'],
                 'email': row['alias_email'],
                 'created_at': row['used_at'],
-                'fingerprint': hashlib.sha256(value.encode()).hexdigest(),
+                'fingerprint': fingerprint,
             }
         return None
 
@@ -1169,6 +1383,10 @@ class Database:
     def update_settings(self, settings):
         with self._write_lock:
             normalized = dict(settings)
+            if MAX_CODE_RETRIES_SETTING_KEY in normalized:
+                normalized[MAX_CODE_RETRIES_SETTING_KEY] = str(
+                    self._parse_code_retries(normalized[MAX_CODE_RETRIES_SETTING_KEY])
+                )
             max_aliases = None
             if MAX_ALIASES_SETTING_KEY in normalized:
                 max_aliases = self._parse_max_aliases(
