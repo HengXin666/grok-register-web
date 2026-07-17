@@ -53,7 +53,8 @@ socketio = SocketIO(app, async_mode='threading')
 db = Database()
 browser_mgr = BrowserManager(
     headless=False,
-    extension_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'turnstilePatch')
+    extension_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'turnstilePatch'),
+    browser_path=os.environ.get('GROK_REGISTER_BROWSER_PATH', ''),
 )
 email_mgr = EmailManager(db)
 oauth_mgr = OAuthManager(db)

@@ -64,6 +64,17 @@ pip install -r requirements.txt
 python app.py
 ```
 
+如果启动任务时出现 `WinError 216`，程序会自动尝试 Windows 常见的 Chrome 安装路径。
+仍无法启动时，可显式指定可执行文件：
+
+```powershell
+$env:GROK_REGISTER_BROWSER_PATH = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+python app.py
+```
+
+该路径必须是当前 Windows 可直接运行的 `chrome.exe`，不要填写 ChromeDriver、压缩包、
+Linux/ARM 版本或扩展目录。
+
 默认打开 `http://localhost:5000`。
 
 ```bash

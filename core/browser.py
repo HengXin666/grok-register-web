@@ -18,6 +18,47 @@ class BrowserError(Exception):
     pass
 
 
+def _contains_winerror(exc, code):
+    """Return whether an exception chain contains a Windows error code."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, 'winerror', None) == code:
+            return True
+        if getattr(current, 'errno', None) == code:
+            return True
+        current = getattr(current, '__cause__', None) or getattr(current, '__context__', None)
+    return False
+
+
+def _windows_chrome_candidates():
+    """Return common Chrome executable locations on Windows."""
+    if not sys.platform.startswith('win'):
+        return []
+    roots = [
+        os.environ.get('PROGRAMFILES'),
+        os.environ.get('PROGRAMFILES(X86)'),
+        os.environ.get('LOCALAPPDATA'),
+    ]
+    suffix = os.path.join('Google', 'Chrome', 'Application', 'chrome.exe')
+    return [os.path.join(root, suffix) for root in roots if root]
+
+
+def _browser_path_candidates(configured_path, default_path='chrome'):
+    """Build deterministic browser path fallbacks without hiding explicit config."""
+    configured = (configured_path or '').strip()
+    if configured:
+        return [configured]
+
+    candidates = []
+    for path in (default_path, *_windows_chrome_candidates()):
+        path = str(path or '').strip()
+        if path and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
 def _parsed_proxy_url(proxy):
     value = (proxy or '').strip()
     if not value:
@@ -73,11 +114,12 @@ def validate_proxy_endpoint(proxy, timeout=3):
 
 class BrowserManager:
     def __init__(self, headless=False, extension_path=None, user_data_path=None,
-                 proxy=''):
+                 proxy='', browser_path=''):
         self.headless = headless
         self.extension_path = extension_path
         self.user_data_path = user_data_path
         self.proxy = (proxy or '').strip()
+        self.browser_path = (browser_path or '').strip()
         self._browser = None
         self._page = None
         self._runtime_user_data_path = None
@@ -93,6 +135,7 @@ class BrowserManager:
             extension_path=self.extension_path,
             user_data_path=user_data_path,
             proxy=self.proxy,
+            browser_path=self.browser_path,
         )
 
     def _prepare_user_data_path(self):
@@ -176,25 +219,46 @@ class BrowserManager:
 
         result = [None]
         error = [None]
-
-        def _create():
-            try:
-                result[0] = Chromium(co)
-            except Exception as e:
-                error[0] = e
-
+        paths = _browser_path_candidates(self.browser_path, co.browser_path)
         start_timeout = 45 if self.user_data_path else 20
-        t = threading.Thread(target=_create, daemon=True)
-        t.start()
-        t.join(timeout=start_timeout)
 
-        if t.is_alive():
-            raise BrowserError(f"Browser startup timed out (>{start_timeout}s)")
-        if error[0]:
+        for index, browser_path in enumerate(paths):
+            result[0] = None
+            error[0] = None
+            co.set_browser_path(browser_path)
+            logger.info('Browser executable candidate: %s', browser_path)
+
+            def _create():
+                try:
+                    result[0] = Chromium(co)
+                except Exception as e:
+                    error[0] = e
+
+            t = threading.Thread(target=_create, daemon=True)
+            t.start()
+            t.join(timeout=start_timeout)
+
+            if t.is_alive():
+                self._cleanup_runtime_profile()
+                raise BrowserError(f"Browser startup timed out (>{start_timeout}s)")
+            if not error[0] and result[0] is not None:
+                break
+            if error[0] and _contains_winerror(error[0], 216) and index + 1 < len(paths):
+                logger.warning(
+                    'Browser executable is incompatible with Windows: %s; trying fallback %s',
+                    browser_path,
+                    paths[index + 1],
+                )
+                continue
             self._cleanup_runtime_profile()
-            raise BrowserError(f"Failed to start browser: {error[0]}")
-        if result[0] is None:
-            self._cleanup_runtime_profile()
+            if error[0] and _contains_winerror(error[0], 216):
+                raise BrowserError(
+                    'Chrome executable is incompatible with this Windows installation '
+                    f'({browser_path}). Install the official Windows Chrome build or '
+                    'set GROK_REGISTER_BROWSER_PATH to a valid chrome.exe.'
+                ) from error[0]
+            if error[0]:
+                raise BrowserError(f"Failed to start browser: {error[0]}") from error[0]
             raise BrowserError("Browser startup returned None")
 
         self._browser = result[0]
