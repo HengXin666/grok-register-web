@@ -67,6 +67,8 @@ class RegistrationState:
         self._failed = 0
         self._active_workers = {}
         self._provisional_workers = set()
+        self._next_round_at = None
+        self._next_round_in = 0
 
     @property
     def status(self):
@@ -255,6 +257,43 @@ class RegistrationState:
         self._pause_event.set()
         logger.info('Registration stop requested')
 
+    def wait_for_next_round(self, seconds, on_tick=None):
+        """Wait between rounds while remaining responsive to pause and stop."""
+        remaining = max(0.0, float(seconds or 0))
+        if remaining <= 0:
+            return not self.should_stop()
+
+        logger.info('Waiting %.0fs before starting the next registration', remaining)
+        last_reported = None
+        while remaining > 0 and not self.should_stop():
+            if not self._pause_event.is_set():
+                self.check_pause()
+                if self.should_stop():
+                    break
+
+            step = min(1.0, remaining)
+            with self._lock:
+                self._status = 'waiting'
+                self._next_round_in = max(1, int(remaining + 0.999))
+                self._next_round_at = time.time() + remaining
+                report = self._next_round_in
+            if report != last_reported and on_tick:
+                on_tick()
+                last_reported = report
+            started = time.monotonic()
+            time.sleep(step)
+            if self._pause_event.is_set():
+                remaining -= time.monotonic() - started
+
+        with self._lock:
+            self._next_round_at = None
+            self._next_round_in = 0
+            if not self._stop_flag:
+                self._status = 'running'
+        if on_tick:
+            on_tick()
+        return not self.should_stop()
+
     def get_snapshot(self):
         with self._lock:
             workers = [
@@ -271,4 +310,6 @@ class RegistrationState:
                 'completed': self._completed,
                 'success': self._success,
                 'failed': self._failed,
+                'next_round_at': self._next_round_at,
+                'next_round_in': self._next_round_in,
             }

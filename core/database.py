@@ -45,6 +45,8 @@ DEFAULT_SETTINGS = {
     'max_confirm_retries': '3',
     'max_retries_per_alias': '3',
     'registration_timeout': '300',
+    # Delay after a completed registration attempt before claiming the next alias.
+    'registration_interval_seconds': '300',
     'registration_concurrency': '1',
     'browser_headless': 'false',
     # Keep the existing browser flow as the safe default.  ``protocol`` and
@@ -1554,6 +1556,18 @@ class Database:
                 normalized[MAX_CODE_RETRIES_SETTING_KEY] = str(
                     self._parse_code_retries(normalized[MAX_CODE_RETRIES_SETTING_KEY])
                 )
+            if 'registration_interval_seconds' in normalized:
+                try:
+                    interval_seconds = int(normalized['registration_interval_seconds'])
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        'registration_interval_seconds must be an integer'
+                    )
+                if interval_seconds < 0 or interval_seconds > 86400:
+                    raise ValueError(
+                        'registration_interval_seconds must be between 0 and 86400'
+                    )
+                normalized['registration_interval_seconds'] = str(interval_seconds)
             max_aliases = None
             if MAX_ALIASES_SETTING_KEY in normalized:
                 max_aliases = self._parse_max_aliases(

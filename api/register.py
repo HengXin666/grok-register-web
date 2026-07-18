@@ -171,6 +171,8 @@ def init_register_api(db, browser_mgr, email_mgr, socketio):
                 'completed': 0,
                 'success': 0,
                 'failed': 0,
+                'next_round_at': None,
+                'next_round_in': 0,
                 'mode': None,
             },
             'message': '',

@@ -220,13 +220,16 @@ function ensureStatusShell(root, labels) {
 function updateStatus(data) {
     const statusMap = {
         running: ['badge-running', '正在运行'],
+        waiting: ['badge-paused', '等待下一轮'],
         paused: ['badge-paused', '任务已暂停'],
         stopped: ['badge-stopped', '任务已停止'],
     };
     const [cls, text] = statusMap[data.status] || statusMap.stopped;
 
     const isReactivate = data.mode === 'reactivate';
-    const currentRoundText = data.current_round !== undefined && data.current_round > 0 ? `第 ${data.current_round} 轮` : '等待中';
+    const currentRoundText = data.status === 'waiting' && data.next_round_in > 0
+        ? `${data.next_round_in} 秒后开始`
+        : (data.current_round !== undefined && data.current_round > 0 ? `第 ${data.current_round} 轮` : '等待中');
     const activeWorkers = Array.isArray(data.active_workers) ? data.active_workers : [];
     const currentEmailText = activeWorkers.length
         ? activeWorkers.map(worker => `${worker.worker_id}: ${worker.email}`).join(' | ')

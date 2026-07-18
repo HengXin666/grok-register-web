@@ -199,6 +199,7 @@ export async function render(container) {
                     ${field('s-max-aliases', '每账号最大别名数', s.max_aliases_per_account || 5, { min: 1, helper: '仅 Microsoft 主邮箱使用；临时邮箱固定为 1。' })}
                     ${field('s-code-retries', '验证码轮询次数', s.max_code_retries || 10, { min: 1 })}
                     ${field('s-timeout', '注册超时限制 (秒)', s.registration_timeout || 300, { min: 30 })}
+                    ${field('s-registration-interval', '每轮注册间隔 (秒)', s.registration_interval_seconds ?? 300, { min: 0, helper: '一轮结束后再等待此时间领取下一个邮箱；300 秒即每 5 分钟一轮，0 表示不等待。' })}
                     ${field('s-confirm-retries', '确认邮箱重试次数', s.max_confirm_retries || 3, { min: 1 })}
                     ${field('s-alias-retries', '每别名最大重试次数', s.max_retries_per_alias || 3, { min: 1 })}
                     ${field('s-registration-concurrency', '并发注册 Worker 数', 1, { min: 1, max: 1, readonly: true, helper: '稳定模式固定为 1。' })}
@@ -423,6 +424,7 @@ function collectSettings() {
         max_aliases_per_account: document.getElementById('s-max-aliases').value,
         max_code_retries: document.getElementById('s-code-retries').value,
         registration_timeout: document.getElementById('s-timeout').value,
+        registration_interval_seconds: document.getElementById('s-registration-interval').value,
         max_confirm_retries: document.getElementById('s-confirm-retries').value,
         max_retries_per_alias: document.getElementById('s-alias-retries').value,
         registration_concurrency: document.getElementById('s-registration-concurrency').value,

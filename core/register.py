@@ -137,6 +137,9 @@ class RegistrationEngine:
             120,
             int(settings.get('registration_timeout', 300) or 300) * 2,
         )
+        interval_seconds = max(
+            0, int(settings.get('registration_interval_seconds', 300) or 0),
+        )
         try:
             self.browser.start()
         except Exception as exc:
@@ -218,6 +221,14 @@ class RegistrationEngine:
                     heartbeat.join(timeout=2)
                     self.state.clear_worker(worker_id)
                     self._emit_status()
+                if (
+                    interval_seconds > 0
+                    and self.state.has_worker_round_capacity(max_rounds)
+                    and not self.state.should_stop()
+                ):
+                    self.state.wait_for_next_round(
+                        interval_seconds, on_tick=self._emit_status,
+                    )
         finally:
             self.state.clear_worker(worker_id)
             try:
