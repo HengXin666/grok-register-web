@@ -60,6 +60,11 @@ DEFAULT_SETTINGS = {
     'export_format': 'txt',
     'export_dir': './data',
     'grok2api_auto_upload': 'false',
+    'grok2api_probe_chat': 'false',
+    'grok2api_probe_proxy': '',
+    'grok2api_probe_delay_sec': '45',
+    'grok2api_probe_retries': '2',
+    'grok2api_probe_retry_gap_sec': '60',
     # CPA hotload + pool keeper
     'cpa_auto_export': 'false',
     'cpa_auth_dir': '/cpa/auths',
@@ -174,6 +179,10 @@ class Database:
                     grok2api_error TEXT DEFAULT '',
                     grok2api_attempts INTEGER DEFAULT 0,
                     grok2api_updated_at DATETIME,
+                    grok2api_probe_status TEXT DEFAULT '',
+                    grok2api_probe_http_status INTEGER DEFAULT 0,
+                    grok2api_probe_error TEXT DEFAULT '',
+                    grok2api_probe_updated_at DATETIME,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -384,6 +393,10 @@ class Database:
             'grok2api_error': "TEXT DEFAULT ''",
             'grok2api_attempts': 'INTEGER DEFAULT 0',
             'grok2api_updated_at': 'DATETIME',
+            'grok2api_probe_status': "TEXT DEFAULT ''",
+            'grok2api_probe_http_status': 'INTEGER DEFAULT 0',
+            'grok2api_probe_error': "TEXT DEFAULT ''",
+            'grok2api_probe_updated_at': 'DATETIME',
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -598,6 +611,9 @@ class Database:
         used_aliases = self.conn.execute("SELECT COUNT(*) FROM aliases WHERE status='used'").fetchone()[0]
         ready_aliases = self.conn.execute("SELECT COUNT(*) FROM aliases WHERE status='ready'").fetchone()[0]
         failed_aliases = self.conn.execute("SELECT COUNT(*) FROM aliases WHERE status='failed'").fetchone()[0]
+        chat_denied_accounts = self.conn.execute(
+            "SELECT COUNT(*) FROM registrations WHERE grok2api_probe_status='permission_denied'"
+        ).fetchone()[0]
 
         total_sso = self.conn.execute("SELECT COUNT(*) FROM registrations WHERE status='success'").fetchone()[0]
         today = datetime.now().strftime('%Y-%m-%d')
@@ -626,6 +642,7 @@ class Database:
             'used_aliases': used_aliases,
             'ready_aliases': ready_aliases,
             'failed_aliases': failed_aliases,
+            'chat_denied_accounts': chat_denied_accounts,
             'total_sso': total_sso,
             'today_sso': today_sso,
             'success_rate': success_rate,
@@ -1316,6 +1333,26 @@ class Database:
             )
             self.conn.commit()
 
+    def finish_grok2api_probe(self, reg_id, probe):
+        probe = dict(probe or {})
+        now = datetime.now().isoformat()
+        status_code = int(probe.get('status') or 0)
+        with self._write_lock:
+            self.conn.execute(
+                '''UPDATE registrations
+                   SET grok2api_status='probe_denied',
+                       grok2api_error=?, grok2api_updated_at=?,
+                       grok2api_probe_status='permission_denied',
+                       grok2api_probe_http_status=?, grok2api_probe_error=?,
+                       grok2api_probe_updated_at=?
+                   WHERE id=?''',
+                (
+                    str(probe.get('error') or '')[:1000], now,
+                    status_code, str(probe.get('error') or '')[:1000], now, reg_id,
+                ),
+            )
+            self.conn.commit()
+
     def claim_grok2api_retries(self, limit=20, retry_delay_seconds=30,
                                stale_upload_seconds=300):
         """Atomically claim durable grok2api deliveries ready for retry."""
@@ -1498,6 +1535,27 @@ class Database:
                    ORDER BY created_at DESC'''
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_chat_denied_registrations(self):
+        rows = self.conn.execute(
+            '''SELECT id, email, account_password, sso_value,
+                      grok2api_probe_http_status, grok2api_probe_error,
+                      grok2api_probe_updated_at, created_at
+               FROM registrations
+               WHERE grok2api_probe_status='permission_denied'
+               ORDER BY grok2api_probe_updated_at DESC, id DESC'''
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_chat_denied_registrations(self):
+        with self._write_lock:
+            self.conn.execute(
+                '''UPDATE registrations
+                   SET grok2api_probe_status='', grok2api_probe_http_status=0,
+                       grok2api_probe_error='', grok2api_probe_updated_at=NULL
+                   WHERE grok2api_probe_status='permission_denied' '''
+            )
+            self.conn.commit()
 
     def delete_registrations(self, ids=None, reg_type=None):
         with self._write_lock:

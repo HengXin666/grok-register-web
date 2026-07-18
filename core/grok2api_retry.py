@@ -3,7 +3,7 @@
 import logging
 import threading
 
-from core.grok2api_client import upload_registered_sso
+from core.grok2api_client import Grok2APIChatPermissionError, upload_registered_sso
 
 
 logger = logging.getLogger('register')
@@ -24,24 +24,32 @@ class Grok2APIRetryWorker:
         completed = 0
         for record in records:
             try:
-                upload_registered_sso(
+                result = upload_registered_sso(
                     settings,
                     record['sso_value'],
                     email=record['email'],
                 )
             except Exception as exc:
-                self.db.finish_grok2api_upload(record['id'], False, exc)
+                if isinstance(exc, Grok2APIChatPermissionError):
+                    self.db.finish_grok2api_probe(record['id'], exc.probe)
+                else:
+                    self.db.finish_grok2api_upload(record['id'], False, exc)
                 logger.warning(
                     'grok2api durable retry failed: registration_id=%s error=%s',
                     record['id'], exc,
                 )
             else:
-                self.db.finish_grok2api_upload(record['id'], True)
-                completed += 1
-                logger.info(
-                    'grok2api durable retry completed: registration_id=%s',
-                    record['id'],
-                )
+                if isinstance(result, dict) and result.get('grok2api_probe_denied'):
+                    self.db.finish_grok2api_probe(
+                        record['id'], result['grok2api_probe_denied'],
+                    )
+                else:
+                    self.db.finish_grok2api_upload(record['id'], True)
+                    completed += 1
+                    logger.info(
+                        'grok2api durable retry completed: registration_id=%s',
+                        record['id'],
+                    )
         return completed
 
     def start(self):

@@ -2,7 +2,12 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
-from core.grok2api_client import Grok2APIClient, Grok2APIError, upload_registered_sso
+from core.grok2api_client import (
+    Grok2APIChatPermissionError,
+    Grok2APIClient,
+    Grok2APIError,
+    upload_registered_sso,
+)
 
 
 class Grok2APIClientTest(unittest.TestCase):
@@ -103,6 +108,62 @@ class Grok2APIClientTest(unittest.TestCase):
 
         self.assertEqual(result['cpa']['path'], '/cpa/auths/xai-a.json')
         self.assertIn('grok2api down', result['grok2api_error'])
+
+    def test_grok2api_probe_denied_stops_before_import(self):
+        client = Mock()
+        with patch('core.grok2api_client.Grok2APIClient', return_value=client), patch(
+            'core.grok2api_client.sso_to_build_credential',
+            return_value={'access_token': 'build-token'},
+        ), patch(
+            'core.cpa_export.probe_chat_with_retries',
+            return_value={'ok': False, 'status': 403, 'error': 'permission_denied'},
+        ):
+            with self.assertRaises(Grok2APIChatPermissionError) as raised:
+                upload_registered_sso(
+                    {
+                        'grok2api_auto_upload': 'true',
+                        'grok2api_probe_chat': 'true',
+                        'grok2api_probe_delay_sec': '0',
+                        'grok2api_probe_retries': '0',
+                        'grok2api_url': 'http://127.0.0.1:21434',
+                        'grok2api_username': 'admin',
+                        'grok2api_password': 'secret',
+                    },
+                    'sso-token',
+                    email='denied@example.com',
+                )
+
+        self.assertEqual(raised.exception.probe['status'], 403)
+        client.import_web_sso_and_convert.assert_not_called()
+
+    def test_grok2api_probe_success_imports_account(self):
+        client = Mock()
+        client.import_web_sso_and_convert.return_value = {
+            'import': {'created': 1}, 'conversion': {'created': 1},
+        }
+        with patch('core.grok2api_client.Grok2APIClient', return_value=client), patch(
+            'core.grok2api_client.sso_to_build_credential',
+            return_value={'access_token': 'build-token'},
+        ), patch(
+            'core.cpa_export.probe_chat_with_retries',
+            return_value={'ok': True, 'status': 200, 'body': '{}'},
+        ):
+            result = upload_registered_sso(
+                {
+                    'grok2api_auto_upload': 'true',
+                    'grok2api_probe_chat': 'true',
+                    'grok2api_probe_delay_sec': '0',
+                    'grok2api_probe_retries': '0',
+                    'grok2api_url': 'http://127.0.0.1:21434',
+                    'grok2api_username': 'admin',
+                    'grok2api_password': 'secret',
+                },
+                'sso-token',
+                email='ok@example.com',
+            )
+
+        self.assertTrue(result['grok2api']['probe']['ok'])
+        client.import_web_sso_and_convert.assert_called_once()
 
     def test_web_sso_conversion_rejects_failed_completion_summary(self):
         session = Mock()

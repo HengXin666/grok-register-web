@@ -25,6 +25,16 @@ class Grok2APIError(RuntimeError):
     pass
 
 
+class Grok2APIChatPermissionError(Grok2APIError):
+    """The minted Build credential cannot use chat after all configured retries."""
+
+    def __init__(self, probe):
+        self.probe = dict(probe or {})
+        status = int(self.probe.get('status') or 0)
+        detail = self.probe.get('error') or self.probe.get('body') or 'permission denied'
+        super().__init__(f'grok2api chat probe permission denied: HTTP {status}: {detail}')
+
+
 def _decode_jwt_payload(token):
     try:
         segment = token.split('.')[1]
@@ -398,11 +408,41 @@ def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudfl
         logger.info('Updating grok2api Grok Web egress Cloudflare context...')
         client.upsert_web_egress_context(user_agent, cloudflare_cookies)
     try:
+        probe = {'ok': True, 'skipped': True}
+        if (settings.get('grok2api_probe_chat') or 'false').lower() == 'true':
+            from core.cpa_export import probe_chat_with_retries
+
+            logger.info('grok2api pre-upload chat probe mint started: account=%s', email or '(unnamed)')
+            credential = sso_to_build_credential(sso_cookie, email=email)
+            probe = probe_chat_with_retries(
+                credential['access_token'],
+                proxy=(
+                    settings.get('grok2api_probe_proxy')
+                    or settings.get('browser_proxy')
+                    or ''
+                ).strip() or None,
+                delay_sec=float(settings.get('grok2api_probe_delay_sec') or 45),
+                retries=int(settings.get('grok2api_probe_retries') or 2),
+                retry_gap_sec=float(settings.get('grok2api_probe_retry_gap_sec') or 60),
+            )
+            if not probe.get('ok'):
+                status = int(probe.get('status') or 0)
+                detail = str(probe.get('error') or '').lower()
+                if status in (401, 403) or 'permission' in detail or 'denied' in detail:
+                    raise Grok2APIChatPermissionError(probe)
+                raise Grok2APIError(
+                    f'grok2api chat probe failed: HTTP {status}: '
+                    f'{probe.get("error") or "unknown error"}'
+                )
+            logger.info('grok2api pre-upload chat probe passed: account=%s', email or '(unnamed)')
         result['grok2api'] = client.import_web_sso_and_convert(sso_cookie, email=email)
+        result['grok2api']['probe'] = probe
     except Exception as exc:
         if cpa_enabled:
             # CPA already succeeded; do not fail the whole delivery on secondary backend.
             logger.warning('grok2api pipeline failed after CPA export (ignored): %s', exc)
+            if isinstance(exc, Grok2APIChatPermissionError):
+                result['grok2api_probe_denied'] = exc.probe
             result['grok2api_error'] = str(exc)
             return result
         raise

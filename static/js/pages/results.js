@@ -6,6 +6,7 @@ import { FOLD_CHEVRON, initFoldCards, updateFoldCount } from '../components/fold
 
 let ssoTable = null;
 let accTable = null;
+let chatDeniedTable = null;
 
 const ICONS = {
     accounts: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
@@ -19,6 +20,7 @@ const ICONS = {
     today: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
     rate: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>`,
     duration: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
+    denied: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>`,
 };
 
 
@@ -151,10 +153,30 @@ export async function render(container) {
                 </div>
             </div>
         </div>
+
+        <div class="card fold-card" data-fold="chat-denied" id="fold-chat-denied">
+            <div class="card-header">
+                <button type="button" class="fold-toggle" id="fold-chat-denied-toggle" aria-expanded="false" aria-controls="fold-chat-denied-body">
+                    <span class="fold-chevron" aria-hidden="true">${FOLD_CHEVRON}</span>
+                    <div class="card-title">${ICONS.denied} Chat 探测无权限账号</div>
+                    <span class="fold-meta">
+                        <span class="fold-count" id="chat-denied-count">0</span>
+                        <span class="fold-hint">点击展开</span>
+                    </span>
+                </button>
+                <div class="btn-group actions-tight fold-actions">
+                    <button class="btn btn-sm btn-secondary" id="chat-denied-copy-btn">全选复制</button>
+                    <button class="btn btn-sm btn-danger" id="chat-denied-clear-btn">清空记录</button>
+                </div>
+            </div>
+            <div class="fold-body" id="fold-chat-denied-body" role="region" aria-labelledby="fold-chat-denied-toggle">
+                <div class="fold-body-inner"><div class="fold-scroll" id="chat-denied-table"></div></div>
+            </div>
+        </div>
     `;
 
     initFoldCards(container);
-    await Promise.all([loadStats(), loadSSO(), loadAccounts()]);
+    await Promise.all([loadStats(), loadSSO(), loadAccounts(), loadChatDenied()]);
 
     document.getElementById('sso-reactivate-btn').addEventListener('click', startBatchReactivate);
     document.getElementById('sso-copy-btn').addEventListener('click', copyAllSSO);
@@ -163,6 +185,8 @@ export async function render(container) {
     document.getElementById('acc-copy-btn').addEventListener('click', copyAllAccounts);
     document.getElementById('acc-export-btn').addEventListener('click', () => exportData('accounts'));
     document.getElementById('acc-clear-btn').addEventListener('click', () => clearData('accounts'));
+    document.getElementById('chat-denied-copy-btn').addEventListener('click', copyChatDenied);
+    document.getElementById('chat-denied-clear-btn').addEventListener('click', clearChatDenied);
 }
 
 async function startBatchReactivate() {
@@ -211,12 +235,47 @@ async function loadStats() {
         metricNode(ICONS.used, s.used_aliases, '已使用别名数', 'success'),
         metricNode(ICONS.ready, s.ready_aliases, '待分配别名数', 'info'),
         metricNode(ICONS.failed, s.failed_aliases, '失败别名数', 'error'),
+        metricNode(ICONS.denied, s.chat_denied_accounts, 'Chat 无权限账号', 'error'),
         metricNode(ICONS.sso, s.total_sso, '成功采集 SSO 数', 'accent'),
         metricNode(ICONS.today, s.today_sso, '今日采集 SSO 数', 'info'),
         metricNode(ICONS.rate, `${s.success_rate ?? 0}%`, '别名注册成功率', 'success'),
         metricNode(ICONS.duration, `${s.avg_duration ?? 0}s`, '平均注册耗时', 'warning'),
     );
     animateCountNodes(grid, { duration: 920, stagger: 40 });
+}
+
+async function loadChatDenied() {
+    const res = await api('GET', '/api/results/chat-denied');
+    const el = document.getElementById('chat-denied-table');
+    if (!el) return;
+    const rows = res.data || [];
+    updateFoldCount('chat-denied-count', rows.length);
+    chatDeniedTable = createTable(el, {
+        columns: [
+            { title: '#', width: '50px', render: (r, i) => `${i + 1}` },
+            { title: '注册别名邮箱', key: 'email', render: (r) => textCell('font-medium', r.email) },
+            { title: 'HTTP', width: '80px', render: (r) => textCell('mono', r.grok2api_probe_http_status || '-') },
+            { title: '探测错误', render: (r) => textCell('mono', r.grok2api_probe_error || 'permission denied') },
+            { title: '探测时间', width: '150px', render: (r) => textCell('time-cell', r.grok2api_probe_updated_at ? String(r.grok2api_probe_updated_at).substring(0, 16) : '') },
+        ],
+        data: rows,
+        emptyText: '暂无 Chat 探测无权限账号',
+    });
+}
+
+async function copyChatDenied() {
+    const res = await api('GET', '/api/results/chat-denied');
+    const rows = res.data || [];
+    if (!rows.length) return showToast('没有可复制的无权限账号', 'warning');
+    await navigator.clipboard.writeText(rows.map(r => r.email).join('\n'));
+    showToast(`已复制 ${rows.length} 个无权限账号`, 'success');
+}
+
+async function clearChatDenied() {
+    if (!confirm('确定清空 Chat 探测无权限记录吗？账号和 SSO 注册记录仍会保留。')) return;
+    const res = await api('DELETE', '/api/results/chat-denied');
+    if (res.success) render(document.getElementById('main-content'));
+    else showToast(res.message || '清空失败', 'error');
 }
 
 async function loadSSO() {

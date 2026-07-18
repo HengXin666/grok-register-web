@@ -47,6 +47,19 @@ def init_results_api(db):
         rows = db.get_registrations('accounts')
         return jsonify({'success': True, 'data': rows, 'message': ''})
 
+    @results_bp.route('/api/results/chat-denied', methods=['GET'])
+    def get_chat_denied():
+        return jsonify({
+            'success': True,
+            'data': db.get_chat_denied_registrations(),
+            'message': '',
+        })
+
+    @results_bp.route('/api/results/chat-denied', methods=['DELETE'])
+    def clear_chat_denied():
+        db.clear_chat_denied_registrations()
+        return jsonify({'success': True, 'data': None, 'message': 'Chat probe records cleared'})
+
     @results_bp.route('/api/results/accounts/export', methods=['POST'])
     def export_accounts():
         data = request.get_json() or {}

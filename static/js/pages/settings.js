@@ -121,6 +121,7 @@ export async function render(container) {
     const extractNumbers = s.extract_numbers_enabled === 'true' ? 'true' : 'false';
     const passwordMode = s.password_mode === 'manual' ? 'manual' : 'auto';
     const grok2apiUpload = s.grok2api_auto_upload === 'true' ? 'true' : 'false';
+    const grok2apiProbe = s.grok2api_probe_chat === 'true' ? 'true' : 'false';
     const cpaAuto = s.cpa_auto_export === 'true' ? 'true' : 'false';
     const cpaProbe = s.cpa_probe_chat === 'false' ? 'false' : 'true';
     const cpaPool = s.cpa_pool_enabled === 'true' ? 'true' : 'false';
@@ -320,18 +321,29 @@ export async function render(container) {
                         ], grok2apiUpload)}
                     </div>
                     <div class="settings-field-block">
-                        <div class="settings-field-label">注册后打开 grok.com 做 Web 激活</div>
-                        ${choiceGroup('web-activation', [
-                            { value: 'false', title: '关闭', desc: '推荐。避免浏览器流程每轮再过 Cloudflare。', recommend: true },
-                            { value: 'true', title: '开启', desc: '仅浏览器注册路径生效，可能需要人工验证。' },
-                        ], webActivation)}
-                        <div class="helper-text">协议路径使用 HTTP 完成 TOS/生日；此开关不会改变协议流程。</div>
+                        <div class="settings-field-label">Chat 可用性探测</div>
+                        ${choiceGroup('grok2api-probe', [
+                            { value: 'false', title: '关闭', desc: '保持原上传流程，不额外等待。', recommend: true },
+                            { value: 'true', title: '开启 probe', desc: '上传前 mint Build 凭证并测试 chat；无权限账号不导入。' },
+                        ], grok2apiProbe)}
                     </div>
                 </div>
                 <div class="settings-grid">
                     ${field('s-grok2api-url', 'grok2api 地址', s.grok2api_url || 'http://127.0.0.1:21434', { type: 'text', mono: true })}
                     ${field('s-grok2api-username', '管理员用户名', s.grok2api_username || 'admin', { type: 'text', mono: true })}
                     ${field('s-grok2api-password', '管理员密码', s.grok2api_password || '', { type: 'password' })}
+                    ${field('s-grok2api-probe-proxy', 'Probe 代理', s.grok2api_probe_proxy || s.browser_proxy || '', { type: 'text', mono: true, placeholder: 'http://127.0.0.1:7897' })}
+                    ${field('s-grok2api-probe-delay', 'Probe 前延迟 (秒)', s.grok2api_probe_delay_sec || 45, { min: 0 })}
+                    ${field('s-grok2api-probe-retries', 'Probe 失败重试次数', s.grok2api_probe_retries || 2, { min: 0 })}
+                    ${field('s-grok2api-probe-gap', 'Probe 重试间隔 (秒)', s.grok2api_probe_retry_gap_sec || 60, { min: 0 })}
+                </div>
+                <div class="settings-field-block">
+                    <div class="settings-field-label">注册后打开 grok.com 做 Web 激活</div>
+                    ${choiceGroup('web-activation', [
+                        { value: 'false', title: '关闭', desc: '推荐。避免浏览器流程每轮再过 Cloudflare。', recommend: true },
+                        { value: 'true', title: '开启', desc: '仅浏览器注册路径生效，可能需要人工验证。' },
+                    ], webActivation)}
+                    <div class="helper-text">协议路径使用 HTTP 完成 TOS/生日；此开关不会改变协议流程。</div>
                 </div>
             `)}
 
@@ -442,6 +454,11 @@ function collectSettings() {
         export_format: document.querySelector('input[name="export-format"]:checked').value,
         export_dir: document.getElementById('s-export-dir').value,
         grok2api_auto_upload: document.querySelector('input[name="grok2api-upload"]:checked').value,
+        grok2api_probe_chat: document.querySelector('input[name="grok2api-probe"]:checked')?.value || 'false',
+        grok2api_probe_proxy: document.getElementById('s-grok2api-probe-proxy')?.value.trim() || '',
+        grok2api_probe_delay_sec: document.getElementById('s-grok2api-probe-delay')?.value || '45',
+        grok2api_probe_retries: document.getElementById('s-grok2api-probe-retries')?.value || '2',
+        grok2api_probe_retry_gap_sec: document.getElementById('s-grok2api-probe-gap')?.value || '60',
         grok_web_activation: document.querySelector('input[name="web-activation"]:checked').value,
         grok2api_url: document.getElementById('s-grok2api-url').value,
         grok2api_username: document.getElementById('s-grok2api-username').value,

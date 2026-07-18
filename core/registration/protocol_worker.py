@@ -14,7 +14,7 @@ import requests
 from urllib.parse import urlparse
 
 from config import SIGNUP_URL
-from core.grok2api_client import upload_registered_sso
+from core.grok2api_client import Grok2APIChatPermissionError, upload_registered_sso
 from core.registration.backend import (
     ExistingAccountActionError,
     ProtocolEnvironmentError,
@@ -937,7 +937,12 @@ class ProtocolRegistrationWorker:
                 user_agent='',
                 cloudflare_cookies='',
             )
-            self.db.finish_grok2api_upload(reg_id, True)
+            if isinstance(upload_result, dict) and upload_result.get('grok2api_probe_denied'):
+                self.db.finish_grok2api_probe(
+                    reg_id, upload_result['grok2api_probe_denied'],
+                )
+            else:
+                self.db.finish_grok2api_upload(reg_id, True)
             if upload_result is not None:
                 imported = upload_result.get('import', {})
                 converted = upload_result.get('conversion', {})
@@ -948,7 +953,10 @@ class ProtocolRegistrationWorker:
                     converted.get('created', 0),
                 )
         except Exception as upload_error:
-            self.db.finish_grok2api_upload(reg_id, False, upload_error)
+            if isinstance(upload_error, Grok2APIChatPermissionError):
+                self.db.finish_grok2api_probe(reg_id, upload_error.probe)
+            else:
+                self.db.finish_grok2api_upload(reg_id, False, upload_error)
             logger.warning('[protocol] grok2api auto upload failed: %s', upload_error)
 
     def _handle_round_failure(self, exc, error_msg, duration, reg_id, alias,
