@@ -47,13 +47,13 @@ class EmailManagerGraphTest(unittest.TestCase):
 
     @patch('core.email_manager.requests.post')
     def test_graph_scope_is_used_when_legacy_refresh_has_no_mail_access(self, post):
-        denied_one = Mock(status_code=400, text='')
-        denied_one.json.return_value = {'error': 'invalid_scope'}
-        denied_two = Mock(status_code=400, text='')
-        denied_two.json.return_value = {'error': 'invalid_scope'}
+        # refresh_token tries empty-scope / IMAP / Graph.default before Mail.Read.
+        # Fail every earlier audience, then grant on consumers + SCOPES.
+        denied = Mock(status_code=400, text='')
+        denied.json.return_value = {'error': 'invalid_scope'}
         granted = Mock(status_code=200, text='')
         granted.json.return_value = {'access_token': 'graph-access-token'}
-        post.side_effect = [denied_one, denied_two, granted]
+        post.side_effect = [denied, denied, denied, denied, granted]
         self.manager._detect_mail_api = Mock(return_value=('graph', ''))
 
         _, access_token, mail_api = self.manager.refresh_token(
@@ -62,12 +62,17 @@ class EmailManagerGraphTest(unittest.TestCase):
 
         self.assertEqual(access_token, 'graph-access-token')
         self.assertEqual(mail_api, 'graph')
-        third_call = post.call_args_list[2]
+        self.assertEqual(len(post.call_args_list), 5)
+        graph_call = post.call_args_list[4]
         self.assertEqual(
-            third_call.args[0],
+            graph_call.args[0],
             'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
         )
-        self.assertEqual(third_call.kwargs['data']['scope'], SCOPES)
+        self.assertEqual(graph_call.kwargs['data']['scope'], SCOPES)
+        self.assertEqual(
+            post.call_args_list[2].kwargs['data']['scope'],
+            'https://outlook.office.com/IMAP.AccessAsUser.All offline_access',
+        )
 
     @patch('core.email_manager.requests.get')
     def test_reads_verification_code_from_graph_message(self, get):
