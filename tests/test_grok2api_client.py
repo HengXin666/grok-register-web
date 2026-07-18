@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from core.grok2api_client import Grok2APIClient, Grok2APIError, upload_registered_sso
 
@@ -70,16 +70,39 @@ class Grok2APIClientTest(unittest.TestCase):
     def test_disabled_auto_upload_is_explicitly_logged(self):
         with self.assertLogs('register', level='INFO') as logs:
             result = upload_registered_sso(
-                {'grok2api_auto_upload': 'false'},
+                {'grok2api_auto_upload': 'false', 'cpa_auto_export': 'false'},
                 'sso-token',
                 email='user@example.com',
             )
 
         self.assertIsNone(result)
         self.assertIn(
-            'grok2api auto upload disabled; skipping Web import and Build conversion',
+            'No delivery backend enabled (cpa_auto_export / grok2api_auto_upload)',
             '\n'.join(logs.output),
         )
+
+    def test_cpa_success_ignores_secondary_grok2api_failure(self):
+        client = Mock()
+        client.import_web_sso_and_convert.side_effect = RuntimeError('grok2api down')
+        with patch('core.grok2api_client.Grok2APIClient', return_value=client):
+            with patch(
+                'core.cpa_export.export_sso_to_cpa',
+                return_value={'path': '/cpa/auths/xai-a.json', 'probe': {'ok': True}},
+            ):
+                result = upload_registered_sso(
+                    {
+                        'cpa_auto_export': 'true',
+                        'grok2api_auto_upload': 'true',
+                        'grok2api_url': 'http://127.0.0.1:21434',
+                        'grok2api_username': 'admin',
+                        'grok2api_password': 'secret',
+                    },
+                    'sso-token',
+                    email='user@example.com',
+                )
+
+        self.assertEqual(result['cpa']['path'], '/cpa/auths/xai-a.json')
+        self.assertIn('grok2api down', result['grok2api_error'])
 
     def test_web_sso_conversion_rejects_failed_completion_summary(self):
         session = Mock()
