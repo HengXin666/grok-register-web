@@ -68,9 +68,9 @@ Microsoft 会按「每账号最大别名数」生成 `邮箱` / `邮箱+1@域名
 
 协议路径强烈建议：
 
-- Turnstile = **仅外置**
-- 本地 Solver URL = `http://127.0.0.1:5072`（安装 `requirements-solver.txt` 后由应用托管）
-- 并发 Worker = **1**
+- Cloudflare 人机验证 = **仅外置**
+- 本地求解器 URL = `http://127.0.0.1:5072`（安装 `requirements-solver.txt` 后由应用托管）
+- 并发注册数 = **1**
 
 两层「浏览器」不要混：
 
@@ -81,17 +81,17 @@ Microsoft 会按「每账号最大别名数」生成 `邮箱` / `邮箱+1@域名
 
 ---
 
-## 4. 配置 Turnstile Solver
+## 4. 配置 Cloudflare 人机验证（Turnstile）求解器
 
 设置页 **注册后端与人机**：
 
 1. 协议路径下选 **仅外置**
-2. 填本地 Solver 地址（默认 `http://127.0.0.1:5072`）
+2. 填本地求解器地址（默认 `http://127.0.0.1:5072`）
 3. 点 **测试连接**；需要时可 **启动 / 停止**
 
-也可使用 YesCaptcha：填 Key 后优先云端打码，一般不再自动起本地 Solver。
+也可使用 YesCaptcha：填 Key 后优先云端打码，一般不再自动起本地求解器。
 
-不要把本地 Solver 暴露到公网。
+不要把本地求解器暴露到公网。
 
 ---
 
@@ -107,7 +107,7 @@ Microsoft 会按「每账号最大别名数」生成 `邮箱` / `邮箱+1@域名
 建议：
 
 - 要进 grok2api 号池：开「自动导入 Web 并转换 Build」
-- 只要有 chat 的号再入库：开 **Chat 可用性探测**
+- 只要有对话权限的号再入库：开 **对话可用性探测**
 - 要热载 CLIProxyAPI：开 CPA；probe 建议开，避免污染热池
 - 两个都开时：CPA 成功后 grok2api 失败**只记警告**，整轮交付仍算成功（CPA 为主）
 
@@ -132,22 +132,22 @@ Round N SUCCESS! Duration: 28.0s transport=http turnstile=local_solver
 
 ```text
 注册后端 = 协议
-Turnstile = 仅外置 + 本地 Solver
-并发 = 1
+Cloudflare 人机验证 = 仅外置 + 本地求解器
+并发注册数 = 1
 关闭「注册后打开 grok.com 做 Web 激活」
-按需开启 grok2api 和/或 CPA
+需要时开启 grok2api 和/或 CPA
 ```
 
 | 项 | 推荐值 |
 |----|--------|
 | 注册传输后端 | `protocol` |
-| Turnstile | `external` + 本地 Solver |
-| 并发 Worker | `1` |
-| 每轮间隔 | `0`–`30`s（风控紧时加大） |
+| Cloudflare 人机验证 | `external` + 本地求解器 |
+| 并发注册数 | `1` |
+| 每轮间隔 | `0`–`30` 秒（风控偏紧时加大） |
 | 注册后 Web 激活 | 关 |
-| grok2api 上传 | 按需 |
-| Chat probe | 要「有 chat 才入库」时开 |
-| CPA | 按需 |
+| grok2api 上传 | 需要时开启 |
+| 对话可用性探测 | 仅在「有对话权限才入库」时开启 |
+| CPA | 需要时开启 |
 
 ---
 

@@ -108,10 +108,10 @@ bash scripts/run_with_xvfb.sh --host 0.0.0.0 --port 5000 --allow-remote
 1. **邮箱**页导入 Microsoft 账号，或设置临时邮箱  
 2. **设置**页：
    - 注册传输后端 = **协议**
-   - Turnstile = **仅外置** + 本地 Solver（`http://127.0.0.1:5072`）
-   - 并发 Worker = **1**
+   - Cloudflare 人机验证 = **仅外置** + 本地求解器（`http://127.0.0.1:5072`）
+   - 并发注册数 = **1**
    - 关闭「注册后打开 grok.com 做 Web 激活」
-   - 可选：grok2api 自动上传 / Chat probe / CPA  
+   - 可选：grok2api 自动上传 / 对话可用性探测 / CPA  
 3. **注册**页启动 1 轮验证  
 4. 日志出现 `Round SUCCESS`（及可选 delivery 完成）
 
@@ -130,15 +130,16 @@ Round N SUCCESS! Duration: 28.0s transport=http turnstile=local_solver
 
 | 项 | 值 | 说明 |
 |----|----|------|
-| 注册传输后端 | `protocol` | 无业务 Chrome，批跑更稳 |
-| Turnstile | `external` + 本地 Solver | 禁止回退注册浏览器 |
-| 并发 Worker | `1` | 先稳再谈并发 |
-| 每轮间隔 | `0`–`30`s | 风控紧时加大 |
-| 注册后 Web 激活 | 关 | 仅 browser 路径有意义 |
-| grok2api 自动上传 | 按需开 | 本机需可达管理端 |
-| Chat probe | 要「有 chat 才入库」时开 | 无权限仍会本地存 SSO |
-| CPA 热载 | 按需开 | 与 grok2api 可独立或同时启用 |
-| 出口代理 | 与 Solver 一致 | Docker 勿写容器内 `127.0.0.1` 当宿主机代理 |
+| 注册传输后端 | `protocol` | 不启动业务用 Chrome，批量注册更稳 |
+| Cloudflare 人机验证 | `external` + 本地求解器 | 禁止回退到注册用浏览器解验证 |
+| 并发注册数 | `1` | 先保持单路稳定，再考虑提高并发 |
+| 每轮间隔 | `0`–`30` 秒 | 风控偏紧时加大间隔 |
+| 注册后 Web 激活 | 关 | 仅浏览器注册路径有意义 |
+| grok2api 自动上传 | 需要时开启 | 本机须能访问 grok2api 管理端 |
+| 对话可用性探测 | 仅在「有对话权限才入库」时开启 | 无权限时仍会把 SSO 保存在本地 |
+| CPA 热载 | 需要时开启 | 可与 grok2api 单独或同时开启 |
+| 出口代理 | 与本地求解器一致 | Docker 中勿把容器内 `127.0.0.1` 当成宿主机代理 |
+
 
 更多组合见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#3-推荐组合)。
 

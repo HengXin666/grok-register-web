@@ -13,6 +13,7 @@
 - 补充 grok2api 出口节点缺失、Device OAuth 限流等交付类错误
 - 刷新产品描述（含 grok2api 与 CPA）与 meta / 侧栏状态文案
 - 拆分文档：`docs/USAGE.md`、`docs/CONFIGURATION.md`、`docs/TROUBLESHOOTING.md`；README 改为概览 + 快速开始 + 索引
+- 稳定长跑配置表改用更稳妥中文（避免「并发 Worker / Turnstile / Chat probe」被机翻成乱码）
 
 ### UI 文案
 
