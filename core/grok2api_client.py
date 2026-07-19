@@ -428,13 +428,23 @@ def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudfl
             if not probe.get('ok'):
                 status = int(probe.get('status') or 0)
                 detail = str(probe.get('error') or '').lower()
-                if status in (401, 403) or 'permission' in detail or 'denied' in detail:
+                classification = str(probe.get('classification') or '')
+                if (
+                    status in (401, 403)
+                    or classification in ('chat_permission_denied', 'unexpected_model')
+                    or 'permission' in detail
+                    or 'denied' in detail
+                    or 'unexpected model' in detail
+                ):
                     raise Grok2APIChatPermissionError(probe)
                 raise Grok2APIError(
                     f'grok2api chat probe failed: HTTP {status}: '
                     f'{probe.get("error") or "unknown error"}'
                 )
-            logger.info('grok2api pre-upload chat probe passed: account=%s', email or '(unnamed)')
+            logger.info(
+                'grok2api pre-upload chat probe passed: account=%s model=%s',
+                email or '(unnamed)', probe.get('model') or '',
+            )
         result['grok2api'] = client.import_web_sso_and_convert(sso_cookie, email=email)
         result['grok2api']['probe'] = probe
     except Exception as exc:

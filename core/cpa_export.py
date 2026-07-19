@@ -139,6 +139,66 @@ def _proxy_candidates(proxy: str | None) -> list[str | None]:
     return uniq
 
 
+# Successful free Build accounts currently answer chat with this model id.
+REQUIRED_CHAT_MODEL_PREFIX = 'grok-4.5'
+REQUIRED_CHAT_MODEL_SUFFIX = '-build-free'
+
+
+def is_accepted_chat_model(model: str | None) -> bool:
+    """Return True when upstream model is the expected grok-4.5 free Build id."""
+    value = (model or '').strip().lower()
+    if not value:
+        return False
+    return value.startswith(REQUIRED_CHAT_MODEL_PREFIX) and value.endswith(REQUIRED_CHAT_MODEL_SUFFIX)
+
+
+def evaluate_chat_probe_response(status_code: int, body_text: str | None) -> dict[str, Any]:
+    """Classify a chat completion response for pre-upload gating.
+
+    Pass only when:
+    1. HTTP status is 2xx (chat permission works)
+    2. JSON body has a model field matching grok-4.5*-build-free
+    """
+    text = body_text or ''
+    result: dict[str, Any] = {
+        'ok': False,
+        'status': int(status_code or 0),
+        'model': '',
+        'classification': 'chat_probe_failed',
+        'body': text[:500] if 200 <= int(status_code or 0) < 300 else None,
+        'error': None if 200 <= int(status_code or 0) < 300 else text[:500],
+    }
+    if not (200 <= result['status'] < 300):
+        detail = (text or '').lower()
+        if result['status'] in (401, 403) or 'permission' in detail or 'denied' in detail:
+            result['classification'] = 'chat_permission_denied'
+        return result
+
+    try:
+        data = json.loads(text) if text else {}
+    except Exception:
+        result['error'] = 'chat probe returned non-json body'
+        result['classification'] = 'invalid_response'
+        return result
+
+    if not isinstance(data, dict):
+        result['error'] = 'chat probe returned non-object json'
+        result['classification'] = 'invalid_response'
+        return result
+
+    model = str(data.get('model') or '').strip()
+    result['model'] = model
+    if is_accepted_chat_model(model):
+        result['ok'] = True
+        result['error'] = None
+        result['classification'] = 'chat_allowed_free'
+        return result
+
+    result['error'] = f'unexpected model: {model or "<empty>"}'
+    result['classification'] = 'unexpected_model'
+    return result
+
+
 def probe_chat(access_token: str, *, proxy: str | None = None, timeout: float = 45.0) -> dict[str, Any]:
     url = f'{DEFAULT_BASE_URL}/chat/completions'
     payload = {
@@ -153,7 +213,13 @@ def probe_chat(access_token: str, *, proxy: str | None = None, timeout: float = 
         'Accept': 'application/json',
         **DEFAULT_HEADERS,
     }
-    last: dict[str, Any] = {'ok': False, 'status': 0, 'error': 'no attempt'}
+    last: dict[str, Any] = {
+        'ok': False,
+        'status': 0,
+        'model': '',
+        'classification': 'chat_probe_failed',
+        'error': 'no attempt',
+    }
     for px in _proxy_candidates(proxy):
         label = px or 'direct'
         try:
@@ -163,20 +229,29 @@ def probe_chat(access_token: str, *, proxy: str | None = None, timeout: float = 
                 url, json=payload, headers=headers, proxies=proxies,
                 impersonate='chrome', timeout=timeout,
             )
-            ok = 200 <= resp.status_code < 300
+            last = evaluate_chat_probe_response(resp.status_code, resp.text or '')
+            last['proxy'] = label
+            if last.get('ok'):
+                logger.info(
+                    'CPA chat probe via %s: status=%s model=%s classification=%s',
+                    label, last.get('status'), last.get('model'), last.get('classification'),
+                )
+                return last
+            # hard permission-denied / wrong model: still try other egress once
+            logger.info(
+                'CPA chat probe via %s: status=%s model=%s classification=%s error=%s',
+                label, last.get('status'), last.get('model'),
+                last.get('classification'), (last.get('error') or '')[:160],
+            )
+        except Exception as e:  # noqa: BLE001
             last = {
-                'ok': ok,
-                'status': resp.status_code,
-                'body': (resp.text or '')[:500] if ok else None,
-                'error': None if ok else (resp.text or '')[:500],
+                'ok': False,
+                'status': 0,
+                'model': '',
+                'classification': 'chat_probe_failed',
+                'error': str(e),
                 'proxy': label,
             }
-            if ok:
-                return last
-            # hard permission-denied: still try other egress once, then give up attempts for this round
-            logger.info('CPA chat probe via %s: status=%s', label, resp.status_code)
-        except Exception as e:  # noqa: BLE001
-            last = {'ok': False, 'status': 0, 'error': str(e), 'proxy': label}
             logger.warning('CPA chat probe via %s failed: %s', label, e)
     return last
 
@@ -194,14 +269,24 @@ def probe_chat_with_retries(
         logger.info('CPA chat probe delay %.0fs before first attempt', delay_sec)
         time.sleep(delay_sec)
     attempts = max(1, int(retries) + 1)
-    last: dict[str, Any] = {'ok': False, 'status': 0, 'error': 'not attempted'}
+    last: dict[str, Any] = {
+        'ok': False,
+        'status': 0,
+        'model': '',
+        'classification': 'chat_probe_failed',
+        'error': 'not attempted',
+    }
     for i in range(attempts):
         last = probe_chat(access_token, proxy=proxy)
         logger.info(
-            'CPA chat probe attempt %s/%s: ok=%s status=%s proxy=%s',
-            i + 1, attempts, last.get('ok'), last.get('status'), last.get('proxy'),
+            'CPA chat probe attempt %s/%s: ok=%s status=%s model=%s classification=%s proxy=%s',
+            i + 1, attempts, last.get('ok'), last.get('status'),
+            last.get('model'), last.get('classification'), last.get('proxy'),
         )
         if last.get('ok'):
+            return last
+        # Wrong model is a hard quality gate; retries rarely change the model id.
+        if last.get('classification') == 'unexpected_model':
             return last
         if i + 1 < attempts and retry_gap_sec > 0:
             logger.info('CPA chat probe retry sleep %.0fs', retry_gap_sec)
@@ -232,14 +317,19 @@ def export_sso_to_cpa(settings: dict, sso_cookie: str, email: str = '') -> dict[
             retries=retries,
             retry_gap_sec=retry_gap,
         )
-        logger.info('CPA chat probe final: ok=%s status=%s', probe.get('ok'), probe.get('status'))
+        logger.info(
+            'CPA chat probe final: ok=%s status=%s model=%s classification=%s',
+            probe.get('ok'), probe.get('status'), probe.get('model'), probe.get('classification'),
+        )
         if not probe.get('ok'):
+            reason = probe.get('classification') or 'chat_probe_failed'
             dest = write_auth(
                 dead_dir,
                 {
                     **payload,
                     'disabled': True,
-                    'disabled_reason': 'chat_probe_failed',
+                    'disabled_reason': reason,
+                    'probe_model': (probe.get('model') or '')[:120],
                     'probe_error': (probe.get('error') or '')[:300],
                 },
             )

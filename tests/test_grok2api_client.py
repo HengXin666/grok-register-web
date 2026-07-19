@@ -146,7 +146,13 @@ class Grok2APIClientTest(unittest.TestCase):
             return_value={'access_token': 'build-token'},
         ), patch(
             'core.cpa_export.probe_chat_with_retries',
-            return_value={'ok': True, 'status': 200, 'body': '{}'},
+            return_value={
+                'ok': True,
+                'status': 200,
+                'model': 'grok-4.5-build-free',
+                'classification': 'chat_allowed_free',
+                'body': '{"model":"grok-4.5-build-free"}',
+            },
         ):
             result = upload_registered_sso(
                 {
@@ -163,6 +169,7 @@ class Grok2APIClientTest(unittest.TestCase):
             )
 
         self.assertTrue(result['grok2api']['probe']['ok'])
+        self.assertEqual(result['grok2api']['probe']['model'], 'grok-4.5-build-free')
         client.import_web_sso_and_convert.assert_called_once()
 
     def test_web_sso_conversion_rejects_failed_completion_summary(self):

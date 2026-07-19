@@ -102,7 +102,7 @@ Microsoft 会按「每账号最大别名数」生成 `邮箱` / `邮箱+1@域名
 | 后端 | 作用 | 默认 |
 |------|------|------|
 | **grok2api** | Web 导入 SSO → Build 转换；失败 durable 补传 | 关 |
-| **CPA** | mint OAuth →（可选）chat probe → 热载 `xai-*.json` | 关 |
+| **CPA** | mint OAuth →（可选）chat probe（须 `model=grok-4.5*-build-free`）→ 热载 `xai-*.json` | 关 |
 
 建议：
 
@@ -171,8 +171,9 @@ Cloudflare 人机验证 = 仅外置 + 本地求解器
 | `grok2api auto upload failed: ...` | 即时交付失败 | 否，但出号仍成功 |
 | `Build conversion reported failed=1; retrying once` | 转换瞬时失败，正在重试 | 观察下一行 |
 | `durable retry completed` | 后台补传成功 | 交付最终成功 |
-| `chat probe passed` | 当前凭证可 chat | 号池质量 OK |
+| `chat probe passed` | 可 chat 且响应 `model` 为 `grok-4.5*-build-free` | 号池质量 OK |
 | `chat probe ... 403/429` | 无权限或限流 | SSO 仍在；稍后重试 |
+| `unexpected model: ...` | 有 chat 但 model 首字段不是 free Build | 拒上传，避免污染号池 |
 
 **注册成功 ≠ 即时上传成功 ≠ chat 可用。**
 
