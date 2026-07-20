@@ -935,7 +935,7 @@ class ProtocolRegistrationWorker:
             if grok2api_enabled:
                 self._upload_grok2api(settings, sso, alias_email, reg_id)
             else:
-                self.state.record_chat_probe('skipped')
+                self.state.record_chat_probe('skipped', reg_id=reg_id)
 
             self.state.record_success(worker_id)
             mode = self._mode_summary()
@@ -1000,7 +1000,7 @@ class ProtocolRegistrationWorker:
                 )
             else:
                 self.db.finish_grok2api_upload(reg_id, True)
-            self.state.record_chat_probe_from_upload(upload_result)
+            self.state.record_chat_probe_from_upload(upload_result, reg_id=reg_id)
             if upload_result is not None:
                 imported = upload_result.get('import', {}) or upload_result.get('grok2api', {}).get('import', {})
                 converted = upload_result.get('conversion', {}) or upload_result.get('grok2api', {}).get('conversion', {})
@@ -1015,7 +1015,7 @@ class ProtocolRegistrationWorker:
                 self.db.finish_grok2api_probe(reg_id, upload_error.probe)
             else:
                 self.db.finish_grok2api_upload(reg_id, False, upload_error)
-            self.state.record_chat_probe_from_upload(error=upload_error)
+            self.state.record_chat_probe_from_upload(error=upload_error, reg_id=reg_id)
             logger.warning('[protocol] grok2api auto upload failed: %s', upload_error)
 
     def _handle_round_failure(self, exc, error_msg, duration, reg_id, alias,

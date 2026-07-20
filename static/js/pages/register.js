@@ -1,10 +1,71 @@
 import { api } from '../api.js';
 import { showToast } from '../components/toast.js';
 import { createLogPanel } from '../components/log-panel.js';
-import { connectSocket } from '../websocket.js';
+import { connectSocket, disconnectSocketHandlers } from '../websocket.js';
 import { countUp } from '../components/count-up.js';
 
 let logPanel = null;
+let socketHandlers = null;
+let statusPollTimer = null;
+let countdownTimer = null;
+/** Latest status snapshot from API / websocket; countdown tick re-renders from this. */
+let lastStatus = null;
+
+function stopStatusPoll() {
+    if (statusPollTimer != null) {
+        clearInterval(statusPollTimer);
+        statusPollTimer = null;
+    }
+}
+
+function stopCountdownTimer() {
+    if (countdownTimer != null) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+    }
+}
+
+function remainingSecondsFromStatus(data) {
+    if (!data) return 0;
+    const at = Number(data.next_round_at);
+    if (Number.isFinite(at) && at > 0) {
+        return Math.max(0, Math.ceil(at - Date.now() / 1000));
+    }
+    const n = Number(data.next_round_in);
+    return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0;
+}
+
+function isWaitingForNextRound(data) {
+    if (!data) return false;
+    if (data.status === 'waiting') return true;
+    // Tolerate brief status skew: deadline still in the future ⇒ show countdown.
+    return remainingSecondsFromStatus(data) > 0 && data.status !== 'stopped';
+}
+
+async function refreshStatusFromApi() {
+    try {
+        const statusRes = await api('GET', '/api/register/status');
+        if (statusRes.success) updateStatus(statusRes.data);
+    } catch (err) {
+        console.warn('register status poll failed', err);
+    }
+}
+
+function startStatusPoll() {
+    stopStatusPoll();
+    // Fallback when websocket events are delayed/dropped (waiting countdown,
+    // durable-retry status bumps). Lightweight GET every 2s.
+    statusPollTimer = setInterval(refreshStatusFromApi, 2000);
+}
+
+function ensureCountdownTimer() {
+    if (countdownTimer != null) return;
+    // Local 1Hz redraw so "N 秒后开始" ticks even if socket/poll is quiet.
+    countdownTimer = setInterval(() => {
+        if (!lastStatus || !isWaitingForNextRound(lastStatus)) return;
+        updateStatus(lastStatus, { fromCountdownTick: true });
+    }, 1000);
+}
 
 const PAUSE_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
 const RESUME_ICON = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
@@ -94,13 +155,21 @@ export async function render(container) {
 
     logPanel = createLogPanel(document.getElementById('log-panel-container'));
 
-    connectSocket({
-        onLog: (data) => logPanel.addLog(data),
+    // Drop previous page subscription if user navigated away and back.
+    if (socketHandlers) {
+        disconnectSocketHandlers(socketHandlers);
+        socketHandlers = null;
+    }
+    stopStatusPoll();
+    stopCountdownTimer();
+    lastStatus = null;
+
+    socketHandlers = {
+        onLog: (data) => logPanel && logPanel.addLog(data),
         onLogReplay: (data) => {
-            if (data && Array.isArray(data.entries)) {
-                for (const entry of data.entries) {
-                    logPanel.addLog(entry);
-                }
+            if (!logPanel || !data || !Array.isArray(data.entries)) return;
+            for (const entry of data.entries) {
+                logPanel.addLog(entry);
             }
         },
         onStatusUpdate: (data) => updateStatus(data),
@@ -108,10 +177,13 @@ export async function render(container) {
             if (data.success) showToast(`第 ${data.round} 轮注册成功! 耗时: ${data.duration}秒`, 'success');
         },
         onError: (data) => showToast(data.message, 'error'),
-    });
+        onConnect: () => refreshStatusFromApi(),
+    };
+    connectSocket(socketHandlers);
+    startStatusPoll();
+    ensureCountdownTimer();
 
-    const statusRes = await api('GET', '/api/register/status');
-    if (statusRes.success) updateStatus(statusRes.data);
+    await refreshStatusFromApi();
 
     document.getElementById('start-btn').addEventListener('click', startRegistration);
     document.getElementById('reactivate-btn').addEventListener('click', startReactivation);
@@ -248,18 +320,34 @@ function ensureStatusShell(root, labels) {
     root.dataset.ready = '1';
 }
 
-function updateStatus(data) {
+function updateStatus(data, opts = {}) {
+    if (!data || typeof data !== 'object') return;
+    // Keep a copy so the 1Hz countdown can recompute remaining from next_round_at
+    // without waiting for the next server push.
+    if (!opts.fromCountdownTick) {
+        lastStatus = { ...data };
+    } else if (lastStatus) {
+        data = lastStatus;
+    }
+
+    const remaining = remainingSecondsFromStatus(data);
+    const waiting = isWaitingForNextRound(data);
+    const effectiveStatus = waiting && data.status !== 'paused' && data.status !== 'stopped'
+        ? 'waiting'
+        : (data.status || 'stopped');
+
     const statusMap = {
         running: ['badge-running', '正在运行'],
         waiting: ['badge-paused', '等待下一轮'],
         paused: ['badge-paused', '任务已暂停'],
         stopped: ['badge-stopped', '任务已停止'],
     };
-    const [cls, text] = statusMap[data.status] || statusMap.stopped;
+    const [cls, text] = statusMap[effectiveStatus] || statusMap.stopped;
 
     const isReactivate = data.mode === 'reactivate';
-    const currentRoundText = data.status === 'waiting' && data.next_round_in > 0
-        ? `${data.next_round_in} 秒后开始`
+    // Prefer live local countdown while interval wait is active.
+    const currentRoundText = waiting && remaining > 0
+        ? `${remaining} 秒后开始`
         : (data.current_round !== undefined && data.current_round > 0 ? `第 ${data.current_round} 轮` : '等待中');
     const activeWorkers = Array.isArray(data.active_workers) ? data.active_workers : [];
     const currentEmailText = activeWorkers.length
@@ -289,18 +377,23 @@ function updateStatus(data) {
         const prev = badgeEl.dataset.status || '';
         badgeEl.className = `badge ${cls}`;
         badgeEl.textContent = text;
-        if (prev && prev !== (data.status || 'stopped')) {
+        if (prev && prev !== effectiveStatus) {
             badgeEl.classList.remove('is-flash');
             void badgeEl.offsetWidth;
             badgeEl.classList.add('is-flash');
         }
-        badgeEl.dataset.status = data.status || 'stopped';
+        badgeEl.dataset.status = effectiveStatus;
     }
     if (roundEl) roundEl.textContent = currentRoundText;
     if (emailEl) {
-        emailEl.textContent = currentEmailText;
-        emailEl.title = currentEmailText;
+        // During inter-round wait there is no active worker; keep the tile honest.
+        const emailText = waiting ? '无活跃账号' : currentEmailText;
+        emailEl.textContent = emailText;
+        emailEl.title = emailText;
     }
+
+    // Countdown ticks only need to refresh process/badge text; skip number animations.
+    if (opts.fromCountdownTick) return;
 
     // Animate numeric tiles from previous displayed value → new value
     if (completedEl) countUp(completedEl, `${data.completed || 0} 轮`, { duration: 640 });

@@ -74,6 +74,13 @@ register_logger = logging.getLogger('register')
 register_logger.setLevel(logging.INFO)
 register_logger.addHandler(socket_handler)
 
+# Durable delivery must update the live dashboard when a later retry
+# upgrades failed → passed/denied for the same registration_id.
+grok2api_retry_worker.set_hooks(
+    state_getter=lambda: register_api._state,
+    status_emitter=lambda snapshot: socketio.emit('status_update', snapshot),
+)
+
 
 @app.before_request
 def enforce_same_origin_for_writes():

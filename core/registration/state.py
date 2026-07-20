@@ -70,6 +70,9 @@ class RegistrationState:
         self._chat_probe_denied = 0
         self._chat_probe_failed = 0
         self._chat_probe_skipped = 0
+        # Per-registration outcome so durable retry can upgrade failed → passed/denied
+        # without double-counting the same reg_id on the live dashboard.
+        self._chat_probe_by_reg = {}
         self._active_workers = {}
         self._provisional_workers = set()
         self._next_round_at = None
@@ -243,27 +246,50 @@ class RegistrationState:
                 self._active_workers.pop(worker_id, None)
                 self._provisional_workers.discard(worker_id)
 
-    def record_chat_probe(self, outcome):
+    def _bump_chat_probe(self, outcome, delta):
+        key = str(outcome or '').strip().lower()
+        if key == 'passed':
+            self._chat_probe_passed = max(0, self._chat_probe_passed + delta)
+        elif key == 'denied':
+            self._chat_probe_denied = max(0, self._chat_probe_denied + delta)
+        elif key == 'failed':
+            self._chat_probe_failed = max(0, self._chat_probe_failed + delta)
+        elif key == 'skipped':
+            self._chat_probe_skipped = max(0, self._chat_probe_skipped + delta)
+
+    def record_chat_probe(self, outcome, reg_id=None):
         """Count one pre-upload chat probe outcome for the live dashboard.
 
         Outcomes:
-          - passed: HTTP 2xx from cli-chat-proxy
+          - passed: HTTP 2xx chat entitlement (or probe ok before a later Build fail)
           - denied: 401/403 / permission denied (no chat entitlement)
-          - failed: probe ran but failed for other reasons (429 exhausted, network, …)
+          - failed: mint/probe/delivery failed for other reasons (429, network, …)
           - skipped: probe disabled or not attempted
+
+        When ``reg_id`` is provided, a later durable-retry outcome for the same
+        registration replaces the previous counter instead of double-counting.
         """
         key = str(outcome or '').strip().lower()
+        if key not in ('passed', 'denied', 'failed', 'skipped'):
+            return
         with self._lock:
-            if key == 'passed':
-                self._chat_probe_passed += 1
-            elif key == 'denied':
-                self._chat_probe_denied += 1
-            elif key == 'failed':
-                self._chat_probe_failed += 1
-            elif key == 'skipped':
-                self._chat_probe_skipped += 1
+            if reg_id is not None:
+                try:
+                    rid = int(reg_id)
+                except (TypeError, ValueError):
+                    rid = None
+                if rid is not None:
+                    prev = self._chat_probe_by_reg.get(rid)
+                    if prev == key:
+                        return
+                    if prev:
+                        self._bump_chat_probe(prev, -1)
+                    self._chat_probe_by_reg[rid] = key
+                    self._bump_chat_probe(key, 1)
+                    return
+            self._bump_chat_probe(key, 1)
 
-    def record_chat_probe_from_upload(self, upload_result=None, error=None):
+    def record_chat_probe_from_upload(self, upload_result=None, error=None, reg_id=None):
         """Derive probe stats from upload_registered_sso result or raised error."""
         try:
             from core.grok2api_client import Grok2APIChatPermissionError
@@ -271,18 +297,35 @@ class RegistrationState:
             Grok2APIChatPermissionError = type('Grok2APIChatPermissionError', (Exception,), {})
 
         if error is not None and isinstance(error, Grok2APIChatPermissionError):
-            self.record_chat_probe('denied')
+            self.record_chat_probe('denied', reg_id=reg_id)
             return
         if error is not None:
-            # Upload failed after/around probe for a non-permission reason.
+            # Prefer structured probe attached by the upload pipeline (e.g. Build
+            # failed after a successful chat probe → still count as passed).
+            attached = getattr(error, 'probe', None)
+            if isinstance(attached, dict) and attached:
+                if attached.get('skipped'):
+                    self.record_chat_probe('skipped', reg_id=reg_id)
+                elif attached.get('ok'):
+                    self.record_chat_probe('passed', reg_id=reg_id)
+                else:
+                    self.record_chat_probe('failed', reg_id=reg_id)
+                return
             detail = str(error).lower()
-            if 'chat probe' in detail:
-                self.record_chat_probe('failed')
+            if (
+                'permission denied' in detail
+                or 'permission-denied' in detail
+                or 'chat_permission_denied' in detail
+            ):
+                self.record_chat_probe('denied', reg_id=reg_id)
+                return
+            # Mint/rate-limit/Build/network failures must not silently drop.
+            self.record_chat_probe('failed', reg_id=reg_id)
             return
         if not isinstance(upload_result, dict):
             return
         if upload_result.get('grok2api_probe_denied'):
-            self.record_chat_probe('denied')
+            self.record_chat_probe('denied', reg_id=reg_id)
             return
         probe = {}
         grok2 = upload_result.get('grok2api')
@@ -291,13 +334,16 @@ class RegistrationState:
         elif isinstance(upload_result.get('probe'), dict):
             probe = upload_result['probe']
         if not probe:
+            # Successful delivery with probe disabled still counts as skipped so
+            # dashboard tiles remain consistent with successful-alias count.
+            self.record_chat_probe('skipped', reg_id=reg_id)
             return
         if probe.get('skipped'):
-            self.record_chat_probe('skipped')
+            self.record_chat_probe('skipped', reg_id=reg_id)
         elif probe.get('ok'):
-            self.record_chat_probe('passed')
+            self.record_chat_probe('passed', reg_id=reg_id)
         else:
-            self.record_chat_probe('failed')
+            self.record_chat_probe('failed', reg_id=reg_id)
 
     def pause(self):
         self._pause_event.clear()

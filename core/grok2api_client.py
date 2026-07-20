@@ -407,8 +407,8 @@ def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudfl
     if user_agent and cloudflare_cookies:
         logger.info('Updating grok2api Grok Web egress Cloudflare context...')
         client.upsert_web_egress_context(user_agent, cloudflare_cookies)
+    probe = {'ok': True, 'skipped': True}
     try:
-        probe = {'ok': True, 'skipped': True}
         if (settings.get('grok2api_probe_chat') or 'false').lower() == 'true':
             from core.cpa_export import probe_chat_with_retries
 
@@ -457,11 +457,20 @@ def upload_registered_sso(settings, sso_cookie, email='', user_agent='', cloudfl
         result['grok2api'] = client.import_web_sso_and_convert(sso_cookie, email=email)
         result['grok2api']['probe'] = probe
     except Exception as exc:
+        # Attach probe so dashboard can count "chat passed, Build failed" correctly.
+        if not isinstance(exc, Grok2APIChatPermissionError) and not getattr(exc, 'probe', None):
+            try:
+                exc.probe = dict(probe or {})
+            except Exception:
+                pass
         if cpa_enabled:
             # CPA already succeeded; do not fail the whole delivery on secondary backend.
             logger.warning('grok2api pipeline failed after CPA export (ignored): %s', exc)
             if isinstance(exc, Grok2APIChatPermissionError):
                 result['grok2api_probe_denied'] = exc.probe
+            elif isinstance(probe, dict) and probe.get('ok') and not probe.get('skipped'):
+                # Preserve successful probe when only Web/Build delivery failed.
+                result['grok2api'] = {'probe': probe}
             result['grok2api_error'] = str(exc)
             return result
         raise

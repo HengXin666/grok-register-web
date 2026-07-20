@@ -208,10 +208,10 @@ function init() {
     });
     navigate();
 
-    connectSocket({
-        onLog: () => {},
-        onStatusUpdate: () => {},
-    });
+    // Ensure the shared Socket.IO client is created once at boot. Do not
+    // register no-op handlers here — they used to overwrite page handlers
+    // via Object.assign and freeze the register dashboard after first paint.
+    connectSocket();
 }
 
 if (document.readyState === 'loading') {
