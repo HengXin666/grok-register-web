@@ -1,5 +1,8 @@
+import email
+import email.message
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest.mock import Mock, patch
 
 from config import SCOPES
@@ -456,6 +459,208 @@ class EmailManagerGraphTest(unittest.TestCase):
         self.assertIsInstance(call.kwargs['received_after'], datetime)
         self.assertIsInstance(call.kwargs['seen_message_ids'], set)
         sleep.assert_called_once_with(8)
+
+
+def _rfc822_bytes(
+    *,
+    subject,
+    body,
+    to,
+    sender='noreply@x.ai',
+    extra_headers=None,
+    received_at=None,
+):
+    msg = email.message.EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = to
+    msg['Date'] = format_datetime(received_at or datetime.now(timezone.utc))
+    for name, value in (extra_headers or {}).items():
+        msg[name] = value
+    msg.set_content(body)
+    return msg.as_bytes()
+
+
+class _FakeImapClient:
+    """Minimal IMAP4_SSL stand-in for _imap_get_code unit tests."""
+
+    def __init__(self, messages_by_uid):
+        # messages_by_uid: ordered list of (uid_bytes, rfc822_bytes)
+        self.messages_by_uid = list(messages_by_uid)
+        self.authenticated = False
+        self.selected = False
+        self.logged_out = False
+
+    def authenticate(self, mechanism, callback):
+        self.authenticated = True
+        callback(None)  # XOAUTH2 callback is invoked with server challenge
+        return 'OK', [b'AUTHENTICATE completed']
+
+    def select(self, mailbox):
+        self.selected = mailbox
+        return 'OK', [b'1']
+
+    def search(self, charset, *criteria):
+        uids = b' '.join(uid for uid, _ in self.messages_by_uid)
+        return 'OK', [uids]
+
+    def fetch(self, msg_id, parts):
+        for uid, raw in self.messages_by_uid:
+            if uid == msg_id or uid == (
+                msg_id if isinstance(msg_id, bytes) else str(msg_id).encode()
+            ):
+                return 'OK', [(b'%s (RFC822 {n}' % uid, raw)]
+        return 'OK', [None]
+
+    def logout(self):
+        self.logged_out = True
+        return 'BYE', [b'']
+
+
+class EmailManagerImapTest(unittest.TestCase):
+    def setUp(self):
+        self.db = DummyDatabase()
+        self.manager = EmailManager(self.db)
+        self.now = datetime.now(timezone.utc)
+        self.main = 'user@outlook.com'
+        self.alias1 = 'user+1@outlook.com'
+        self.alias2 = 'user+2@outlook.com'
+
+    def _patch_imap(self, messages):
+        client = _FakeImapClient(messages)
+        return patch(
+            'core.email_manager.imaplib.IMAP4_SSL',
+            return_value=client,
+        ), client
+
+    def test_imap_recipients_parses_original_to_headers(self):
+        raw = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='ABC-111 confirmation code',
+            to=self.main,
+            extra_headers={
+                'X-Original-To': self.alias1,
+                'Envelope-To': self.alias1,
+            },
+        )
+        msg = email.message_from_bytes(raw)
+        recipients = self.manager._imap_recipients(msg)
+        normalized = {r.lower() for r in recipients}
+        self.assertIn(self.main, normalized)
+        self.assertIn(self.alias1, normalized)
+
+    def test_imap_uses_x_original_to_for_plus_alias(self):
+        """Issue #13: Microsoft rewrites To to main; alias is only in X-Original-To."""
+        raw = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='Use HDR-111 to confirm your email.',
+            to=self.main,
+            extra_headers={'X-Original-To': f'User Alias <{self.alias1}>'},
+            received_at=self.now,
+        )
+        imap_patch, _ = self._patch_imap([(b'10', raw)])
+        with imap_patch:
+            code = self.manager._imap_get_code(
+                'opaque-imap-token',
+                mailbox_email=self.main,
+                target_email=self.alias1,
+                main_email=self.main,
+                received_after=self.now - timedelta(seconds=30),
+            )
+        self.assertEqual(code, 'HDR111')
+
+    def test_imap_plus_alias_without_original_header_is_not_used(self):
+        """Strict policy: rewritten To=main alone must not satisfy plus alias."""
+        raw = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='BAD-111 confirmation code',
+            to=self.main,
+            received_at=self.now,
+        )
+        imap_patch, _ = self._patch_imap([(b'11', raw)])
+        with imap_patch:
+            code = self.manager._imap_get_code(
+                'opaque-imap-token',
+                mailbox_email=self.main,
+                target_email=self.alias1,
+                main_email=self.main,
+                received_after=self.now - timedelta(seconds=30),
+            )
+        self.assertIsNone(code)
+
+    def test_imap_selects_exact_alias_among_multiple(self):
+        older = self.now - timedelta(seconds=5)
+        msg_wrong = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='WRG-333 confirmation code',
+            to=self.main,
+            extra_headers={'X-Original-To': self.alias2},
+            received_at=self.now,
+        )
+        msg_target = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='OUT-111 confirmation code',
+            to=self.main,
+            extra_headers={'X-Original-To': self.alias1},
+            received_at=older,
+        )
+        # UIDs ascending; scanner walks newest-first (last 40 reversed)
+        imap_patch, _ = self._patch_imap([
+            (b'20', msg_target),
+            (b'21', msg_wrong),
+        ])
+        with imap_patch:
+            code = self.manager._imap_get_code(
+                'opaque-imap-token',
+                mailbox_email=self.main,
+                target_email=self.alias1,
+                main_email=self.main,
+                received_after=self.now - timedelta(seconds=30),
+            )
+        self.assertEqual(code, 'OUT111')
+
+    def test_imap_mismatch_does_not_pollute_seen_for_retry(self):
+        """Recipient mismatch must not burn the message across poll attempts."""
+        raw = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='RTY-222 confirmation code',
+            to=self.main,
+            received_at=self.now,
+        )
+        seen = set()
+        imap_patch, _ = self._patch_imap([(b'30', raw)])
+        with imap_patch:
+            code = self.manager._imap_get_code(
+                'opaque-imap-token',
+                mailbox_email=self.main,
+                target_email=self.alias1,
+                main_email=self.main,
+                received_after=self.now - timedelta(seconds=30),
+                seen_message_ids=seen,
+            )
+        self.assertIsNone(code)
+        self.assertNotIn('imap:30', seen)
+
+        # Same UID now carries X-Original-To (simulates fuller header view / retry)
+        raw2 = _rfc822_bytes(
+            subject='Your Grok confirmation code',
+            body='RTY-222 confirmation code',
+            to=self.main,
+            extra_headers={'X-Original-To': self.alias1},
+            received_at=self.now,
+        )
+        imap_patch2, _ = self._patch_imap([(b'30', raw2)])
+        with imap_patch2:
+            code2 = self.manager._imap_get_code(
+                'opaque-imap-token',
+                mailbox_email=self.main,
+                target_email=self.alias1,
+                main_email=self.main,
+                received_after=self.now - timedelta(seconds=30),
+                seen_message_ids=seen,
+            )
+        self.assertEqual(code2, 'RTY222')
+        self.assertIn('imap:30', seen)
 
 
 if __name__ == '__main__':

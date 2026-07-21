@@ -409,6 +409,36 @@ class EmailManager:
             return True
         return '+' not in target.split('@', 1)[0]
 
+    # Microsoft often rewrites plus-address To: to the mailbox primary address.
+    # Original alias evidence lives in X-Original-To / Envelope-To (same set as
+    # Graph/Outlook internetMessageHeaders). Include both common spellings.
+    _IMAP_RECIPIENT_HEADERS = (
+        'To',
+        'Cc',
+        'Delivered-To',
+        'X-Original-To',
+        'X-Delivered-To',
+        'Envelope-To',
+        'X-Envelope-To',
+    )
+
+    @classmethod
+    def _imap_recipients(cls, msg):
+        """Collect recipient addresses from RFC822 headers (incl. original-to)."""
+        result = []
+        for name in cls._IMAP_RECIPIENT_HEADERS:
+            for raw in msg.get_all(name, []) or []:
+                try:
+                    value = str(make_header(decode_header(raw or '')))
+                except Exception:
+                    value = str(raw or '')
+                result.extend(re.findall(
+                    r'[A-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[A-Z0-9.-]+',
+                    value,
+                    re.IGNORECASE,
+                ))
+        return result
+
     @staticmethod
     def _received_at(value):
         try:
@@ -781,7 +811,10 @@ class EmailManager:
                     except Exception:
                         pass
                 body = '\n'.join(body_parts)
-                combined = f'{subject} {sender} {to_hdr} {body}'.lower()
+                recipients = self._imap_recipients(msg)
+                combined = (
+                    f'{subject} {sender} {to_hdr} {" ".join(recipients)} {body}'.lower()
+                )
                 if not any(keyword in combined for keyword in keywords):
                     seen_message_ids.add(fingerprint)
                     continue
@@ -789,24 +822,48 @@ class EmailManager:
                 if not code:
                     seen_message_ids.add(fingerprint)
                     continue
-                seen_message_ids.add(fingerprint)
-                recipients = []
-                for hdr in (to_hdr, msg.get('Cc', '') or '', msg.get('Delivered-To', '') or ''):
-                    for m in re.findall(r'[\w.+-]+@[\w.-]+', str(hdr)):
-                        recipients.append(m.lower())
                 matched = self._recipient_match(recipients, target_email, main_email)
                 if matched is True:
+                    seen_message_ids.add(fingerprint)
                     return code
-                if matched is None and self._allow_ambiguous_recipient_fallback(
+                if matched is False:
+                    # Do not mark seen: a later poll may see fuller headers, and
+                    # mismatch must not burn the only verification message.
+                    logger.info(
+                        'IMAP skip message uid=%s: recipient mismatch '
+                        'target=%s recipients=%s',
+                        mid,
+                        target_email,
+                        recipients,
+                    )
+                    continue
+                # matched is None (ambiguous: e.g. To rewritten to main only)
+                if self._allow_ambiguous_recipient_fallback(
                     target_email, main_email,
                 ):
-                    fallback_codes.append(code)
+                    fallback_codes.append((fingerprint, code))
+                    logger.info(
+                        'IMAP message uid=%s: ambiguous recipients=%s target=%s',
+                        mid,
+                        recipients,
+                        target_email,
+                    )
+                else:
+                    logger.info(
+                        'IMAP skip message uid=%s: plus-alias needs original '
+                        'recipient header (got recipients=%s target=%s)',
+                        mid,
+                        recipients,
+                        target_email,
+                    )
 
             if len(fallback_codes) == 1:
+                fingerprint, code = fallback_codes[0]
+                seen_message_ids.add(fingerprint)
                 logger.info(
                     'IMAP recipient metadata was ambiguous; using the only new xAI message'
                 )
-                return fallback_codes[0]
+                return code
             if len(fallback_codes) > 1:
                 logger.warning(
                     'IMAP returned multiple new xAI messages without an exact recipient match'
