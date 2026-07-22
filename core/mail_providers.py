@@ -424,6 +424,16 @@ class TemporaryMailboxProviders:
         """PASSWORDS — Custom Auth password (only when mode is custom/password)."""
         return str(settings.get('cloudflare_custom_password', '') or '').strip()
 
+    @staticmethod
+    def _cloudflare_mailbox_headers(credential, json_body=False):
+        """Headers for mailbox JWT access (/api/mails). Never mix admin passwords here."""
+        headers = {'Content-Type': 'application/json'} if json_body else {}
+        token = str(credential or '').strip()
+        if not token:
+            raise MailProviderError('Cloudflare mailbox JWT is empty')
+        headers['Authorization'] = f'Bearer {token}'
+        return headers
+
     def _cloudflare_headers(self, settings, json_body=False, token=''):
         """Headers for Cloudflare Temp Email admin / mailbox APIs.
 
@@ -648,10 +658,12 @@ class TemporaryMailboxProviders:
             if not base:
                 raise MailProviderError('Cloudflare cloudflare_api_base is required')
             path = self._path(settings, 'cloudflare_path_messages', '/api/mails')
+            # Mailbox JWT only — admin/custom passwords must NOT override Bearer.
+            # cloudflare_temp_email: Authorization: Bearer <jwt> for /api/mails.
             data = self._json(
                 'GET', f'{base}{path}', settings,
-                headers=self._auth_headers(token=credential),
-                params=self._query_auth(settings, {'limit': 20, 'offset': 0}),
+                headers=self._cloudflare_mailbox_headers(credential),
+                params={'limit': 20, 'offset': 0},
             )
             return self._pick_list(data)
         if provider == 'cloud_mail':
@@ -718,8 +730,7 @@ class TemporaryMailboxProviders:
                 try:
                     data = self._json(
                         'GET', url, settings,
-                        headers=self._auth_headers(token=credential),
-                        params=self._query_auth(settings),
+                        headers=self._cloudflare_mailbox_headers(credential),
                     )
                     if isinstance(data, dict) and isinstance(data.get('data'), dict):
                         return data['data']
