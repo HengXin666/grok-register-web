@@ -248,7 +248,12 @@ class ProtocolRegistrationWorker:
         proxy = resolve_protocol_proxy(settings)
         headless = resolve_browser_headless(settings)
         timeout = int(settings.get('registration_timeout', 300) or 300)
-        turnstile_timeout = max(45, timeout // 4)
+        # Local solvers often need 2–3 minutes under Docker/Xvfb; do not clamp to 75s.
+        try:
+            explicit = int(settings.get('turnstile_timeout') or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        turnstile_timeout = max(120, explicit or (timeout // 2) or 180)
         auto_turnstile = str(settings.get('turnstile_auto', 'true')).lower() != 'false'
         turnstile_cfg = resolve_turnstile_settings(settings)
         self._allow_browser_fallback = turnstile_cfg.get('allow_browser_fallback') != 'false'

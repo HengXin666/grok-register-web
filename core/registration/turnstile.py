@@ -213,9 +213,11 @@ class ExternalTurnstileProvider:
         if self.yescaptcha_key:
             return True
         try:
-            resp = self._http.get(f'{self.solver_url}/', timeout=2)
+            # Docker bridge can be slower than loopback; 2s is too aggressive.
+            resp = self._http.get(f'{self.solver_url}/', timeout=5)
             return resp.status_code < 500
-        except Exception:
+        except Exception as exc:
+            logger.debug('[protocol] local solver probe failed url=%s err=%s', self.solver_url, exc)
             return False
 
     def solve(self, *, url: str, site_key: str, session: requests.Session) -> str:
@@ -309,31 +311,68 @@ class ExternalTurnstileProvider:
         if self.proxy:
             create_url += f'&proxy={quote(self.proxy, safe="")}'
         try:
-            create = self._http.get(create_url, timeout=30)
+            create = self._http.get(create_url, timeout=45)
             create.raise_for_status()
-            task_id = (create.json() or {}).get('taskId')
+            body = create.json() or {}
+            task_id = body.get('taskId')
+            if body.get('errorId') not in (0, None) and not task_id:
+                raise TurnstileSolveError(
+                    f"local solver create error: {body.get('errorDescription') or body}"
+                )
+        except TurnstileSolveError:
+            raise
         except Exception as exc:
-            raise TurnstileSolveError(f'local solver create failed: {exc}') from exc
+            raise TurnstileSolveError(
+                f'local solver create failed ({self.solver_url}): {exc}'
+            ) from exc
         if not task_id:
-            raise TurnstileSolveError('local solver returned no taskId')
+            raise TurnstileSolveError(
+                f'local solver returned no taskId from {self.solver_url}/turnstile'
+            )
 
+        logger.info(
+            '[protocol] local solver task created id=%s url=%s timeout=%ss',
+            task_id, self.solver_url, self.timeout,
+        )
         deadline = time.time() + self.timeout
-        time.sleep(min(5.0, self.timeout / 3))
+        time.sleep(min(3.0, self.timeout / 5))
+        last_status = ''
         while time.time() < deadline:
             try:
                 result = self._http.get(
                     f'{self.solver_url}/result?id={quote(str(task_id), safe="")}',
-                    timeout=20,
+                    timeout=30,
                 )
                 result.raise_for_status()
                 payload = result.json() or {}
+                if payload.get('errorId') not in (0, None):
+                    desc = payload.get('errorDescription') or payload.get('errorCode') or payload
+                    raise TurnstileSolveError(f'local solver failed: {desc}')
+                status = str(payload.get('status') or '')
+                if status and status != last_status:
+                    last_status = status
+                    logger.info('[protocol] local solver task=%s status=%s', task_id, status)
                 token = (payload.get('solution') or {}).get('token')
                 if token:
                     return str(token).strip()
+                # Some builds put the token at top level
+                if payload.get('value') and payload.get('value') not in {
+                    'CAPTCHA_FAIL', 'CAPTCHA_NOT_READY',
+                }:
+                    return str(payload['value']).strip()
+                if payload.get('value') == 'CAPTCHA_FAIL':
+                    raise TurnstileSolveError('local solver CAPTCHA_FAIL')
+            except TurnstileSolveError:
+                raise
             except Exception as exc:
                 logger.debug('[protocol] local solver poll error: %s', exc)
             time.sleep(self.poll_interval)
-        raise TurnstileSolveError(f'local solver timed out after {self.timeout}s')
+        raise TurnstileSolveError(
+            f'local solver timed out after {self.timeout}s '
+            f'(url={self.solver_url} task={task_id} last_status={last_status or "n/a"}). '
+            f'Check turnstile-solver logs; ensure Solver URL is http://turnstile-solver:5072 '
+            f'inside Docker (not 127.0.0.1).'
+        )
 
 
 class BrowserTurnstileProvider:

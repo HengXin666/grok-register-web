@@ -105,6 +105,7 @@ DEFAULT_SETTINGS = {
     'turnstile_provider': 'auto',
     'yescaptcha_key': '',
     'turnstile_solver_url': 'http://127.0.0.1:5072',
+    'turnstile_timeout': '180',
     # When false, protocol worker never starts Chrome (discovery/Turnstile/SSO).
     # external/strict modes default this to false even if the key is left empty.
     'allow_browser_fallback': 'true',
