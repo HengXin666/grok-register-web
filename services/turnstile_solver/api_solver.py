@@ -758,30 +758,31 @@ class TurnstileAPIServer:
                     csi: function() {},
                 };
                 """)
-                await page.set_viewport_size({"width": 500, "height": 100})
+                # Tiny 500x100 viewports routinely fail Turnstile in Docker/Xvfb.
+                # Use a normal desktop size so the widget can fully render.
+                await page.set_viewport_size({"width": 1365, "height": 900})
                 if self.debug:
-                    logger.debug(f"Browser {index}: Set viewport size to 500x100")
+                    logger.debug(f"Browser {index}: Set viewport size to 1365x900")
 
-            if self.debug:
-                logger.debug(
-                    f"Browser {index}: Starting Turnstile solve for URL: {url} "
-                    f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
-                )
-                logger.debug(f"Browser {index}: Loading real website directly: {url}")
+            logger.info(
+                f"Browser {index}: Starting Turnstile solve URL={url} "
+                f"sitekey={sitekey[:24]}… action={action} proxy={proxy or 'none'}"
+            )
 
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.goto(url, wait_until='domcontentloaded', timeout=45000)
             await self._unblock_rendering(page)
+            # Give CF scripts a moment before widget inject.
+            await asyncio.sleep(1.5)
 
-            if self.debug:
-                logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
-
+            logger.info(f"Browser {index}: Injecting Turnstile widget into target site")
             await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
 
             locator = page.locator('input[name="cf-turnstile-response"]')
-            max_attempts = 30
+            # ~90s of polling under Xvfb (was ~30–45s with max_attempts=30)
+            max_attempts = 60
             click_count = 0
-            max_clicks = 10
+            max_clicks = 15
 
             for attempt in range(max_attempts):
                 try:
@@ -861,15 +862,33 @@ class TurnstileAPIServer:
                     continue
 
             elapsed_time = round(time.time() - start_time, 3)
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
-            if self.debug:
-                logger.error(
-                    f"Browser {index}: Error solving Turnstile in "
-                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds"
-                )
+            # Capture a short page diagnostic even outside debug mode.
+            page_hint = ''
+            try:
+                title = await page.title()
+                has_widget = await page.locator('iframe[src*="challenges.cloudflare"], .cf-turnstile, #cf-turnstile').count()
+                has_input = await page.locator('input[name="cf-turnstile-response"]').count()
+                page_hint = f" title={title!r} widgets={has_widget} inputs={has_input}"
+            except Exception as diag_exc:
+                page_hint = f" diag_error={diag_exc}"
+            await save_result(task_id, "turnstile", {
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": elapsed_time,
+                "reason": "token_timeout",
+                "page_hint": page_hint.strip(),
+            })
+            logger.error(
+                f"Browser {index}: CAPTCHA_FAIL after "
+                f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s "
+                f"(no token){page_hint}"
+            )
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
+            await save_result(task_id, "turnstile", {
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": elapsed_time,
+                "reason": str(e)[:300],
+            })
             logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
         finally:
             if self.debug:
@@ -965,10 +984,12 @@ class TurnstileAPIServer:
             return jsonify({"status": "processing"}), 200
 
         if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
+            reason = result.get("reason") or result.get("page_hint") or "Workers could not solve the Captcha"
             return jsonify({
                 "errorId": 1,
                 "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
-                "errorDescription": "Workers could not solve the Captcha"
+                "errorDescription": str(reason)[:500],
+                "elapsed_time": result.get("elapsed_time"),
             }), 200
 
         if isinstance(result, dict) and result.get("value") and result.get("value") != "CAPTCHA_FAIL":

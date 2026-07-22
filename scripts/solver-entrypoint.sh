@@ -42,10 +42,17 @@ fi
 
 cd /app/services/turnstile_solver
 # headless=false under Xvfb is more reliable for Turnstile than pure headless.
+# --debug prints solve attempts / CAPTCHA_FAIL diagnostics into container logs.
+DEBUG_FLAG=()
+if [[ "${SOLVER_DEBUG:-1}" == "1" || "${SOLVER_DEBUG:-}" == "true" ]]; then
+  DEBUG_FLAG+=(--debug)
+fi
+
 exec python start.py \
   --browser_type "${BROWSER_TYPE}" \
   --thread "${THREADS}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --no-headless \
+  "${DEBUG_FLAG[@]}" \
   ${SOLVER_EXTRA_ARGS:-}
