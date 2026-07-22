@@ -22,6 +22,13 @@ def init_settings_api(db):
             db.reset_settings()
             return jsonify({'success': True, 'data': db.get_settings(), 'message': 'Settings reset to defaults'})
 
+        # Seed any newly-added DEFAULT_SETTINGS keys (sub2api_*, etc.) before filter.
+        try:
+            if hasattr(db, 'ensure_default_settings'):
+                db.ensure_default_settings()
+        except Exception:
+            pass
+
         valid_keys = set(DEFAULT_SETTINGS.keys())
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         if not filtered:
@@ -35,6 +42,12 @@ def init_settings_api(db):
                 'data': None,
                 'message': str(exc),
             }), 400
+        except Exception as exc:
+            return jsonify({
+                'success': False,
+                'data': None,
+                'message': f'Settings save failed: {exc}',
+            }), 500
         return jsonify({'success': True, 'data': db.get_settings(), 'message': 'Settings updated'})
 
     @settings_bp.route('/api/settings/turnstile-solver/test', methods=['POST'])

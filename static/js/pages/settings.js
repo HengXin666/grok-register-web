@@ -424,7 +424,7 @@ export async function render(container) {
                 <div class="settings-grid">
                     ${field('s-sub2api-url', 'sub2api 地址', s.sub2api_url || 'https://ai.woa.qzz.io', { type: 'text', mono: true, helper: '需 Admin API Key；Cloudflare 站点用 curl 指纹访问。' })}
                     ${field('s-sub2api-api-key', 'Admin API Key (x-api-key)', s.sub2api_api_key || '', { type: 'password', mono: true })}
-                    ${field('s-sub2api-group-id', '目标分组 ID', s.sub2api_group_id || '12', { min: 1, helper: 'Grok 平台分组，例如「自建Grok」的数字 ID。' })}
+                    ${field('s-sub2api-group-id', '目标分组 ID', s.sub2api_group_id || '12', { type: 'text', mono: true, helper: 'Grok 平台分组数字 ID，例如 12。' })}
                     ${field('s-sub2api-proxy-id', '代理 ID（可选）', s.sub2api_proxy_id || '', { type: 'text', mono: true, placeholder: '留空则不绑代理' })}
                 </div>
             `)}
@@ -683,75 +683,82 @@ async function probeSolverOnline(url) {
     return null;
 }
 
+function val(id, fallback = '') {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    const raw = el.value;
+    return raw == null ? fallback : String(raw);
+}
+
 function collectSettings() {
     const turnstileProvider = currentTurnstileProvider();
     return {
-        email_provider: document.getElementById('s-email-provider').value,
-        duckmail_api_base: document.getElementById('s-duckmail-api-base').value.trim(),
-        duckmail_api_key: document.getElementById('s-duckmail-api-key').value.trim(),
-        yyds_api_base: document.getElementById('s-yyds-api-base').value.trim(),
-        yyds_api_key: document.getElementById('s-yyds-api-key').value.trim(),
-        yyds_jwt: document.getElementById('s-yyds-jwt').value.trim(),
-        cloudflare_api_base: document.getElementById('s-cloudflare-api-base').value.trim(),
-        cloudflare_api_key: document.getElementById('s-cloudflare-api-key').value.trim(),
-        cloudflare_auth_mode: document.getElementById('s-cloudflare-auth-mode').value,
-        cloudflare_path_domains: document.getElementById('s-cloudflare-path-domains').value.trim(),
-        cloudflare_path_accounts: document.getElementById('s-cloudflare-path-accounts').value.trim(),
-        cloudflare_path_token: document.getElementById('s-cloudflare-path-token').value.trim(),
-        cloudflare_path_messages: document.getElementById('s-cloudflare-path-messages').value.trim(),
-        cloudflare_default_domains: document.getElementById('s-cloudflare-default-domains').value.trim(),
-        cloud_mail_api_base: document.getElementById('s-cloud-mail-api-base').value.trim(),
-        cloud_mail_api_key: document.getElementById('s-cloud-mail-api-key').value.trim(),
-        cloud_mail_admin_email: document.getElementById('s-cloud-mail-admin-email').value.trim(),
-        cloud_mail_admin_password: document.getElementById('s-cloud-mail-admin-password').value,
-        max_aliases_per_account: document.getElementById('s-max-aliases').value,
-        max_code_retries: document.getElementById('s-code-retries').value,
-        registration_timeout: document.getElementById('s-timeout').value,
-        registration_interval_seconds: document.getElementById('s-registration-interval').value,
-        max_confirm_retries: document.getElementById('s-confirm-retries').value,
-        max_retries_per_alias: document.getElementById('s-alias-retries').value,
-        registration_concurrency: document.getElementById('s-registration-concurrency').value,
+        email_provider: val('s-email-provider', 'microsoft'),
+        duckmail_api_base: val('s-duckmail-api-base').trim(),
+        duckmail_api_key: val('s-duckmail-api-key').trim(),
+        yyds_api_base: val('s-yyds-api-base').trim(),
+        yyds_api_key: val('s-yyds-api-key').trim(),
+        yyds_jwt: val('s-yyds-jwt').trim(),
+        cloudflare_api_base: val('s-cloudflare-api-base').trim(),
+        cloudflare_api_key: val('s-cloudflare-api-key').trim(),
+        cloudflare_auth_mode: val('s-cloudflare-auth-mode'),
+        cloudflare_path_domains: val('s-cloudflare-path-domains').trim(),
+        cloudflare_path_accounts: val('s-cloudflare-path-accounts').trim(),
+        cloudflare_path_token: val('s-cloudflare-path-token').trim(),
+        cloudflare_path_messages: val('s-cloudflare-path-messages').trim(),
+        cloudflare_default_domains: val('s-cloudflare-default-domains').trim(),
+        cloud_mail_api_base: val('s-cloud-mail-api-base').trim(),
+        cloud_mail_api_key: val('s-cloud-mail-api-key').trim(),
+        cloud_mail_admin_email: val('s-cloud-mail-admin-email').trim(),
+        cloud_mail_admin_password: val('s-cloud-mail-admin-password'),
+        max_aliases_per_account: val('s-max-aliases'),
+        max_code_retries: val('s-code-retries'),
+        registration_timeout: val('s-timeout'),
+        registration_interval_seconds: val('s-registration-interval'),
+        max_confirm_retries: val('s-confirm-retries'),
+        max_retries_per_alias: val('s-alias-retries'),
+        registration_concurrency: val('s-registration-concurrency'),
         registration_backend: currentRegistrationBackend(),
         browser_headless: document.querySelector('input[name="headless"]:checked')?.value || 'false',
         turnstile_auto: document.querySelector('input[name="turnstile"]:checked')?.value || 'true',
-        browser_proxy: document.getElementById('s-browser-proxy').value.trim(),
+        browser_proxy: val('s-browser-proxy').trim(),
         turnstile_provider: turnstileProvider,
         allow_browser_fallback: turnstileProvider === 'external' ? 'false' : 'true',
-        yescaptcha_key: document.getElementById('s-yescaptcha-key').value.trim(),
-        turnstile_solver_url: document.getElementById('s-turnstile-solver-url').value.trim(),
+        yescaptcha_key: val('s-yescaptcha-key').trim(),
+        turnstile_solver_url: val('s-turnstile-solver-url').trim(),
         random_name_enabled: document.querySelector('input[name="random-name"]:checked').value,
         extract_numbers_enabled: document.querySelector('input[name="extract-numbers"]:checked').value,
         password_mode: document.querySelector('input[name="password-mode"]:checked').value,
-        manual_password: document.getElementById('s-manual-password').value,
+        manual_password: val('s-manual-password'),
         export_format: document.querySelector('input[name="export-format"]:checked').value,
-        export_dir: document.getElementById('s-export-dir').value,
+        export_dir: val('s-export-dir'),
         grok2api_auto_upload: document.querySelector('input[name="grok2api-upload"]:checked').value,
         grok2api_probe_chat: document.querySelector('input[name="grok2api-probe"]:checked')?.value || 'false',
-        grok2api_probe_proxy: document.getElementById('s-grok2api-probe-proxy')?.value.trim() || '',
-        grok2api_probe_delay_sec: document.getElementById('s-grok2api-probe-delay')?.value || '45',
-        grok2api_probe_retries: document.getElementById('s-grok2api-probe-retries')?.value || '2',
-        grok2api_probe_retry_gap_sec: document.getElementById('s-grok2api-probe-gap')?.value || '60',
+        grok2api_probe_proxy: val('s-grok2api-probe-proxy').trim(),
+        grok2api_probe_delay_sec: val('s-grok2api-probe-delay', '45'),
+        grok2api_probe_retries: val('s-grok2api-probe-retries', '2'),
+        grok2api_probe_retry_gap_sec: val('s-grok2api-probe-gap', '60'),
         grok_web_activation: document.querySelector('input[name="web-activation"]:checked').value,
-        grok2api_url: document.getElementById('s-grok2api-url').value,
-        grok2api_username: document.getElementById('s-grok2api-username').value,
-        grok2api_password: document.getElementById('s-grok2api-password').value,
+        grok2api_url: val('s-grok2api-url'),
+        grok2api_username: val('s-grok2api-username'),
+        grok2api_password: val('s-grok2api-password'),
         sub2api_auto_upload: document.querySelector('input[name="sub2api-upload"]:checked')?.value || 'false',
-        sub2api_url: document.getElementById('s-sub2api-url')?.value.trim() || '',
-        sub2api_api_key: document.getElementById('s-sub2api-api-key')?.value.trim() || '',
-        sub2api_group_id: document.getElementById('s-sub2api-group-id')?.value.trim() || '',
-        sub2api_proxy_id: document.getElementById('s-sub2api-proxy-id')?.value.trim() || '',
+        sub2api_url: val('s-sub2api-url').trim(),
+        sub2api_api_key: val('s-sub2api-api-key').trim(),
+        sub2api_group_id: val('s-sub2api-group-id').trim(),
+        sub2api_proxy_id: val('s-sub2api-proxy-id').trim(),
         cpa_auto_export: document.querySelector('input[name="cpa-auto"]:checked')?.value || 'false',
         cpa_probe_chat: document.querySelector('input[name="cpa-probe"]:checked')?.value || 'true',
         cpa_auth_dir: document.getElementById('s-cpa-auth-dir')?.value.trim() || '/cpa/auths',
         cpa_dead_dir: document.getElementById('s-cpa-dead-dir')?.value.trim() || '/cpa/auths-chat-dead',
-        cpa_proxy: document.getElementById('s-cpa-proxy')?.value.trim() || '',
-        cpa_probe_delay_sec: document.getElementById('s-cpa-probe-delay')?.value || '45',
-        cpa_probe_retries: document.getElementById('s-cpa-probe-retries')?.value || '2',
-        cpa_probe_retry_gap_sec: document.getElementById('s-cpa-probe-gap')?.value || '60',
+        cpa_proxy: val('s-cpa-proxy').trim(),
+        cpa_probe_delay_sec: val('s-cpa-probe-delay', '45'),
+        cpa_probe_retries: val('s-cpa-probe-retries', '2'),
+        cpa_probe_retry_gap_sec: val('s-cpa-probe-gap', '60'),
         cpa_pool_enabled: document.querySelector('input[name="cpa-pool"]:checked')?.value || 'false',
-        cpa_pool_min: document.getElementById('s-cpa-pool-min')?.value || '5',
-        cpa_pool_max: document.getElementById('s-cpa-pool-max')?.value || '5',
-        cpa_pool_register_rounds: document.getElementById('s-cpa-pool-rounds')?.value || '8',
+        cpa_pool_min: val('s-cpa-pool-min', '5'),
+        cpa_pool_max: val('s-cpa-pool-max', '5'),
+        cpa_pool_register_rounds: val('s-cpa-pool-rounds', '8'),
     };
 }
 
@@ -762,9 +769,30 @@ async function saveSettings() {
         button.classList.add('is-pressed');
     }
     try {
-        const res = await api('PUT', '/api/settings', collectSettings());
-        if (res.success) showToast('系统配置已成功保存并应用', 'success');
-        else showToast(res.message || '保存失败', 'error');
+        let payload;
+        try {
+            payload = collectSettings();
+        } catch (err) {
+            showToast(`收集配置失败: ${err?.message || err}`, 'error');
+            return;
+        }
+        const res = await api('PUT', '/api/settings', payload);
+        if (res.success) {
+            const data = res.data || {};
+            // Surface a clear error if sub2api keys were silently dropped (old server).
+            if (payload.sub2api_auto_upload === 'true' && data.sub2api_auto_upload !== 'true') {
+                showToast(
+                    '配置已写入，但服务端未接受 sub2api_* 字段。请重启 grok-register-web 到最新代码后再保存。',
+                    'error',
+                );
+                return;
+            }
+            showToast('系统配置已成功保存并应用', 'success');
+        } else {
+            showToast(res.message || '保存失败', 'error');
+        }
+    } catch (err) {
+        showToast(err?.message || '保存失败', 'error');
     } finally {
         if (button) {
             button.disabled = false;

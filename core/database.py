@@ -1591,11 +1591,31 @@ class Database:
     # ── Settings CRUD ──────────────────────────────────────────
 
     def get_settings(self):
+        # Always surface current DEFAULT_SETTINGS keys so newly-added options
+        # (e.g. sub2api_*) appear even if the process has not re-seeded the DB row.
         rows = self.conn.execute('SELECT key, value FROM settings').fetchall()
-        return {r['key']: r['value'] for r in rows}
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update({r['key']: r['value'] for r in rows})
+        return merged
+
+    def ensure_default_settings(self):
+        """Insert any DEFAULT_SETTINGS keys missing from the settings table."""
+        with self._write_lock:
+            for key, value in DEFAULT_SETTINGS.items():
+                self.conn.execute(
+                    'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
+                    (key, value),
+                )
+            self.conn.commit()
 
     def update_settings(self, settings):
         with self._write_lock:
+            # Persist newly introduced keys even if init_database ran on older code.
+            for key, value in DEFAULT_SETTINGS.items():
+                self.conn.execute(
+                    'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
+                    (key, value),
+                )
             normalized = dict(settings)
             if 'email_provider' in normalized:
                 provider = str(normalized['email_provider'] or '').strip().lower()
