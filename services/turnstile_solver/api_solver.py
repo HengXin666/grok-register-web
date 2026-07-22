@@ -216,11 +216,24 @@ class TurnstileAPIServer:
             browser_args = [
                 "--window-position=0,0",
                 "--force-device-scale-factor=1",
-                # Docker / Xvfb
+                # Docker / Xvfb performance + stability
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--mute-audio",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-ipc-flooding-protection",
+                "--disable-hang-monitor",
+                "--disable-popup-blocking",
+                "--disable-prompt-on-repost",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--no-first-run",
+                "--password-store=basic",
+                "--enable-features=NetworkService,NetworkServiceInProcess",
             ]
             if config['useragent']:
                 browser_args.append(f"--user-agent={config['useragent']}")
@@ -307,12 +320,24 @@ class TurnstileAPIServer:
             await route.abort()
 
     async def _block_rendering(self, page):
-        """Блокировка рендеринга для экономии ресурсов"""
+        """Optional resource filter.
+
+        Default OFF in Docker: blocking images/fonts/styles often breaks
+        Cloudflare Turnstile and causes silent CAPTCHA_FAIL. Enable with
+        SOLVER_BLOCK_RESOURCES=1 only if you know the site still works.
+        """
+        if str(os.environ.get('SOLVER_BLOCK_RESOURCES', '') or '').strip().lower() not in {
+            '1', 'true', 'yes', 'on',
+        }:
+            return
         await page.route("**/*", self._optimized_route_handler)
 
     async def _unblock_rendering(self, page):
         """Разблокировка рендеринга"""
-        await page.unroute("**/*", self._optimized_route_handler)
+        try:
+            await page.unroute("**/*", self._optimized_route_handler)
+        except Exception:
+            pass
 
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
@@ -769,23 +794,67 @@ class TurnstileAPIServer:
                 f"sitekey={sitekey[:24]}… action={action} proxy={proxy or 'none'}"
             )
 
-            await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            # Prefer networkidle when possible — CF scripts load after DOMContentLoaded.
+            try:
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+            except Exception:
+                await page.goto(url, wait_until='domcontentloaded', timeout=45000)
             await self._unblock_rendering(page)
-            # Give CF scripts a moment before widget inject.
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
             logger.info(f"Browser {index}: Injecting Turnstile widget into target site")
             await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-            await asyncio.sleep(4)
+            # Start clicking early — many managed challenges need an interaction.
+            await asyncio.sleep(1.5)
+            try:
+                await self._try_click_strategies(page, index)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
 
             locator = page.locator('input[name="cf-turnstile-response"]')
-            # ~90s of polling under Xvfb (was ~30–45s with max_attempts=30)
-            max_attempts = 60
+            # ~2 minutes of aggressive polling under Xvfb
+            max_attempts = int(os.environ.get('SOLVER_MAX_ATTEMPTS', '80') or 80)
             click_count = 0
-            max_clicks = 15
+            max_clicks = int(os.environ.get('SOLVER_MAX_CLICKS', '20') or 20)
 
             for attempt in range(max_attempts):
                 try:
+                    # Also read token via JS (faster / more reliable than locator alone)
+                    try:
+                        js_token = await page.evaluate(
+                            """() => {
+                              const nodes = Array.from(document.querySelectorAll(
+                                'input[name="cf-turnstile-response"], input[name="g-recaptcha-response"], textarea[name="cf-turnstile-response"]'
+                              ));
+                              for (const n of nodes) {
+                                if (n && n.value && n.value.length > 20) return n.value;
+                              }
+                              if (window.turnstile && window.turnstile.getResponse) {
+                                try {
+                                  const t = window.turnstile.getResponse();
+                                  if (t && t.length > 20) return t;
+                                } catch (e) {}
+                              }
+                              return '';
+                            }"""
+                        )
+                        if js_token:
+                            elapsed_time = round(time.time() - start_time, 3)
+                            logger.success(
+                                f"Browser {index}: Solved via JS - "
+                                f"{COLORS.get('MAGENTA')}{str(js_token)[:10]}{COLORS.get('RESET')} in "
+                                f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s"
+                            )
+                            await save_result(
+                                task_id, "turnstile",
+                                {"value": str(js_token), "elapsed_time": elapsed_time},
+                            )
+                            return
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: JS token read failed: {e}")
+
                     try:
                         count = await locator.count()
                     except Exception as e:
@@ -794,11 +863,11 @@ class TurnstileAPIServer:
                         count = 0
 
                     if count == 0:
-                        if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                        if attempt % 5 == 0:
+                            logger.info(f"Browser {index}: No token elements yet (attempt {attempt + 1}/{max_attempts})")
                     elif count == 1:
                         try:
-                            token = await locator.input_value(timeout=500)
+                            token = await locator.input_value(timeout=400)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 logger.success(
@@ -817,7 +886,7 @@ class TurnstileAPIServer:
 
                         for i in range(count):
                             try:
-                                element_token = await locator.nth(i).input_value(timeout=500)
+                                element_token = await locator.nth(i).input_value(timeout=400)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(
@@ -835,7 +904,8 @@ class TurnstileAPIServer:
                                     logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
                                 continue
 
-                    if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                    # Click earlier and more often — managed challenges need interaction.
+                    if attempt >= 1 and attempt % 2 == 0 and click_count < max_clicks:
                         click_success = await self._try_click_strategies(page, index)
                         click_count += 1
                         if self.debug:
@@ -847,13 +917,14 @@ class TurnstileAPIServer:
                                     f"{attempt + 1} (click #{click_count}/{max_clicks})"
                                 )
 
-                    wait_time = min(0.5 + (attempt * 0.05), 2.0)
+                    # Tight poll for faster token pickup (was up to 2s)
+                    wait_time = 0.35 if attempt < 20 else 0.55
                     await asyncio.sleep(wait_time)
 
-                    if self.debug and attempt % 5 == 0:
-                        logger.debug(
+                    if attempt % 10 == 0 and attempt > 0:
+                        logger.info(
                             f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - "
-                            f"Waiting for token (clicks: {click_count}/{max_clicks})"
+                            f"still waiting (clicks: {click_count}/{max_clicks})"
                         )
 
                 except Exception as e:

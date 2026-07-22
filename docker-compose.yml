@@ -58,11 +58,18 @@ services:
     environment:
       SOLVER_HOST: "0.0.0.0"
       SOLVER_PORT: "5072"
+      # 单线程更稳：多线程在小机器上反而互相抢 CPU 导致 CAPTCHA_FAIL
       SOLVER_THREADS: ${SOLVER_THREADS:-1}
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-chromium}
-      # 1=verbose solve logs (CAPTCHA_FAIL reason / page diagnostics)
       SOLVER_DEBUG: ${SOLVER_DEBUG:-1}
-    shm_size: "1gb"
+      # 默认不拦截静态资源（拦截易导致 Turnstile 失败）
+      SOLVER_BLOCK_RESOURCES: ${SOLVER_BLOCK_RESOURCES:-0}
+      SOLVER_MAX_ATTEMPTS: ${SOLVER_MAX_ATTEMPTS:-80}
+      SOLVER_MAX_CLICKS: ${SOLVER_MAX_CLICKS:-20}
+    # 性能：共享内存 + 资源预留（有则生效；旧 compose 忽略 cpus 也可）
+    shm_size: "2gb"
+    mem_limit: ${SOLVER_MEM_LIMIT:-2g}
+    cpus: ${SOLVER_CPUS:-2.0}
     security_opt:
       - seccomp:unconfined
     healthcheck:
