@@ -1,32 +1,30 @@
-# grok-register-web
+# grok-register-web — 仅需本文件即可运行（无需源码 / 无需 build）
 #
-# Usage:
-#   docker compose up -d --build
-#   open http://127.0.0.1:5000
+# 用法：
+#   docker compose -f docker-compose.yml up -d
+#   打开 http://127.0.0.1:5000
 #
-# GHCR (after CI publishes):
-#   image: ghcr.io/<owner>/grok-register-web:latest
+# 可选环境变量：
+#   GROK_REGISTER_PORT=5000
+#   GROK_REGISTER_SECRET_KEY=任意随机串
+#   GROK_REGISTER_IMAGE=ghcr.io/hengxin666/grok-register-web:latest
 #
-# Protocol + external Turnstile Solver is the recommended container mode.
-# Do not enable browser Turnstile fallback unless you add Xvfb + Chrome.
+# 说明：
+# - 镜像由 GitHub Actions 推到 GHCR，compose 只 pull，不本地构建。
+# - 推荐：协议注册 + 外置 Turnstile Solver（在网页设置里配置 solver URL）。
+# - 容器内不要指望 headful Chrome（无 DISPLAY）。
 
 services:
   grok-register-web:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: ${GROK_REGISTER_IMAGE:-ghcr.io/hengxin666/grok-register-web:latest}
     container_name: grok-register-web
     restart: unless-stopped
+    pull_policy: always
     ports:
       - "${GROK_REGISTER_PORT:-5000}:5000"
     environment:
-      # Optional secret for Flask sessions
       GROK_REGISTER_SECRET_KEY: ${GROK_REGISTER_SECRET_KEY:-}
-      # Point at a host/network Solver if not co-located
-      # TURNSTILE_SOLVER_URL is not read by app by default — configure in UI / DB.
     volumes:
-      # Persist SQLite + exports
       - grok-register-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5000/"]
@@ -34,22 +32,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 25s
-    # If Solver runs on the same Docker network, add e.g.:
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
-
-  # Optional local Turnstile Solver (Camoufox-based). Enable when you have the
-  # solver dependencies and enough RAM/CPU. Default: profile off — start only
-  # the web console.
-  #
-  # turnstile-solver:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.solver
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5072:5072"
-  #   shm_size: "1gb"
+    extra_hosts:
+      # 便于容器访问宿主机上的 Solver / 代理（Linux Docker）
+      - "host.docker.internal:host-gateway"
 
 volumes:
   grok-register-data:

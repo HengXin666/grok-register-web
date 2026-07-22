@@ -1,0 +1,11 @@
+# 可选：本地从源码构建（开发用）。生产请只用 docker-compose.yml 拉 GHCR。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+
+services:
+  grok-register-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${GROK_REGISTER_IMAGE:-grok-register-web:local}
+    pull_policy: missing
