@@ -1626,14 +1626,20 @@ class Database:
                     )
                 normalized['email_provider'] = provider
             if 'cloudflare_auth_mode' in normalized:
-                auth_mode = str(normalized['cloudflare_auth_mode'] or '').strip().lower()
+                # Accept UI aliases (password / custom) used by cloudflare_temp_email.
+                from core.mail_providers import TemporaryMailboxProviders
+                auth_mode = TemporaryMailboxProviders._normalize_cloudflare_auth_mode(
+                    normalized['cloudflare_auth_mode']
+                )
                 valid_modes = {
                     'none', 'bearer', 'query-key', 'x-api-key', 'x-admin-auth',
+                    'custom', 'basic',
                 }
                 if auth_mode not in valid_modes:
                     raise ValueError(
                         'cloudflare_auth_mode must be one of: '
                         + ', '.join(sorted(valid_modes))
+                        + ' (password/custom-auth aliases map to custom)'
                     )
                 normalized['cloudflare_auth_mode'] = auth_mode
             if MAX_CODE_RETRIES_SETTING_KEY in normalized:

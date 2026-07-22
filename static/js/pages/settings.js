@@ -172,13 +172,15 @@ export async function render(container) {
                     <div class="settings-grid">
                         ${field('s-cloudflare-api-base', 'Cloudflare 邮箱 API Base', s.cloudflare_api_base || '', { type: 'text', mono: true, placeholder: 'https://temp-mail.example.com' })}
                         ${selectField('s-cloudflare-auth-mode', '鉴权方式', s.cloudflare_auth_mode || 'none', [
-                            { value: 'none', label: 'none' },
-                            { value: 'query-key', label: 'query-key' },
+                            { value: 'none', label: 'none（公开接口）' },
+                            { value: 'custom', label: 'custom / password（推荐 · x-admin-auth）' },
+                            { value: 'x-admin-auth', label: 'x-admin-auth' },
+                            { value: 'query-key', label: 'query-key（?key=）' },
                             { value: 'bearer', label: 'bearer' },
                             { value: 'x-api-key', label: 'x-api-key' },
-                            { value: 'x-admin-auth', label: 'x-admin-auth' },
+                            { value: 'basic', label: 'basic（user:pass）' },
                         ], { mono: true })}
-                        ${field('s-cloudflare-api-key', 'API Key / Admin Password', s.cloudflare_api_key || '', { type: 'password' })}
+                        ${field('s-cloudflare-api-key', 'API Key / Admin Password / Custom Auth 密码', s.cloudflare_api_key || '', { type: 'password', helper: 'cloudflare_temp_email 开启 Custom Auth 时，鉴权选 custom，这里填管理密码。' })}
                         ${field('s-cloudflare-default-domains', '默认域名（逗号分隔）', s.cloudflare_default_domains || '', { type: 'text', mono: true, placeholder: 'mail.example.com, mail2.example.com' })}
                         ${field('s-cloudflare-path-domains', '域名路径', s.cloudflare_path_domains || '/api/domains', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-accounts', '创建邮箱路径', s.cloudflare_path_accounts || '/api/new_address', { type: 'text', mono: true })}

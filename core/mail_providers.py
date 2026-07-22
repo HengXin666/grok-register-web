@@ -265,26 +265,59 @@ class TemporaryMailboxProviders:
             raise MailProviderError(f'{url} returned invalid JSON: {preview}') from exc
 
     @staticmethod
+    def _normalize_cloudflare_auth_mode(mode):
+        """Normalize UI / legacy aliases for Cloudflare Temp Email auth."""
+        value = str(mode or 'none').strip().lower()
+        value = value.replace('_', '-').replace(' ', '-')
+        while '--' in value:
+            value = value.replace('--', '-')
+        aliases = {
+            'password': 'custom',
+            'custom-auth': 'custom',
+            'customauth': 'custom',
+            'admin-password': 'custom',
+            'admin': 'custom',
+            'x-admin-auth': 'x-admin-auth',
+            'xadminauth': 'x-admin-auth',
+            'basic-auth': 'basic',
+            'basicauth': 'basic',
+        }
+        return aliases.get(value, value)
+
+    @staticmethod
     def _auth_headers(token='', api_key='', mode='bearer', json_body=False):
         headers = {'Content-Type': 'application/json'} if json_body else {}
         if token:
             headers['Authorization'] = f'Bearer {token}'
-        elif api_key:
-            if mode == 'x-api-key':
-                headers['X-API-Key'] = api_key
-            elif mode == 'x-admin-auth':
-                headers['x-admin-auth'] = api_key
-            elif mode != 'none' and mode != 'query-key':
-                headers['Authorization'] = f'Bearer {api_key}'
+            return headers
+        if not api_key:
+            return headers
+
+        mode = TemporaryMailboxProviders._normalize_cloudflare_auth_mode(mode)
+        # cloudflare_temp_email "Custom Auth" / admin password → x-admin-auth
+        if mode in {'x-admin-auth', 'custom'}:
+            headers['x-admin-auth'] = api_key
+            # Some deployments also accept Authorization for the same password.
+            headers.setdefault('Authorization', f'Bearer {api_key}')
+        elif mode == 'x-api-key':
+            headers['X-API-Key'] = api_key
+        elif mode == 'basic':
+            import base64
+            # Prefer user:pass; bare password becomes :password
+            raw = api_key if ':' in api_key else f':{api_key}'
+            encoded = base64.b64encode(raw.encode('utf-8')).decode('ascii')
+            headers['Authorization'] = f'Basic {encoded}'
+        elif mode not in {'none', 'query-key'}:
+            headers['Authorization'] = f'Bearer {api_key}'
         return headers
 
     @staticmethod
     def _query_auth(settings, params=None):
         result = dict(params or {})
-        if (
-            str(settings.get('cloudflare_auth_mode', 'none')).lower() == 'query-key'
-            and settings.get('cloudflare_api_key')
-        ):
+        mode = TemporaryMailboxProviders._normalize_cloudflare_auth_mode(
+            settings.get('cloudflare_auth_mode', 'none')
+        )
+        if mode == 'query-key' and settings.get('cloudflare_api_key'):
             result['key'] = settings['cloudflare_api_key']
         return result
 
@@ -372,10 +405,17 @@ class TemporaryMailboxProviders:
                 token = (token_data.get('data') or {}).get('token') or ''
         return ProvisionedMailbox('yyds', address, token)
 
-    def _cloudflare_headers(self, settings, json_body=False):
+    def _cloudflare_headers(self, settings, json_body=False, token=''):
+        """Headers for Cloudflare Temp Email admin / mailbox APIs.
+
+        Always attach configured admin/custom password auth when present — not
+        only for ``/admin/new_address``. Public ``/api/new_address`` on locked
+        deployments still requires Custom Auth / x-admin-auth.
+        """
         return self._auth_headers(
+            token=str(token or '').strip(),
             api_key=str(settings.get('cloudflare_api_key', '') or '').strip(),
-            mode=str(settings.get('cloudflare_auth_mode', 'none') or 'none').lower(),
+            mode=str(settings.get('cloudflare_auth_mode', 'none') or 'none'),
             json_body=json_body,
         )
 
@@ -397,21 +437,55 @@ class TemporaryMailboxProviders:
             raise MailProviderError('Cloudflare API Base is required')
         path = self._path(settings, 'cloudflare_path_accounts', '/api/new_address')
         domain = self._next_cloudflare_domain(settings)
-        admin_create = path.rstrip('/').lower() == '/admin/new_address'
-        payload = {'name': self._random_username(), 'enablePrefix': True} if admin_create else {}
-        if domain:
-            payload['domain'] = domain
+        path_lower = path.rstrip('/').lower()
+        admin_create = path_lower.endswith('/admin/new_address') or path_lower.endswith(
+            '/admin/new_address/'
+        )
+        # Prefer official worker payload shapes.
+        if admin_create:
+            payload = {
+                'name': self._random_username(),
+                'enablePrefix': True,
+            }
+            if domain:
+                payload['domain'] = domain
+        else:
+            # Public /api/new_address often expects enablePrefix + optional name/domain.
+            payload = {
+                'name': self._random_username(),
+                'enablePrefix': True,
+            }
+            if domain:
+                payload['domain'] = domain
+        auth_mode = self._normalize_cloudflare_auth_mode(
+            settings.get('cloudflare_auth_mode', 'none')
+        )
+        if auth_mode not in {'none', ''} and not str(settings.get('cloudflare_api_key') or '').strip():
+            raise MailProviderError(
+                'Cloudflare Custom Auth / API password is required when auth mode is not none'
+            )
         try:
             data = self._json(
                 'POST', f'{base}{path}', settings,
-                headers=(
-                    self._cloudflare_headers(settings, json_body=True)
-                    if admin_create else {'Content-Type': 'application/json'}
-                ),
+                # Always send Custom Auth / admin password when configured —
+                # locked workers reject anonymous new_address.
+                headers=self._cloudflare_headers(settings, json_body=True),
+                params=self._query_auth(settings),
                 json=payload,
             )
-            if isinstance(data, dict) and data.get('address') and data.get('jwt'):
-                return ProvisionedMailbox('cloudflare', data['address'], data['jwt'])
+            if isinstance(data, dict):
+                # Various worker versions nest jwt under data / result.
+                nested = data.get('data') if isinstance(data.get('data'), dict) else {}
+                address = data.get('address') or nested.get('address') or ''
+                jwt = (
+                    data.get('jwt')
+                    or data.get('token')
+                    or nested.get('jwt')
+                    or nested.get('token')
+                    or ''
+                )
+                if address and jwt:
+                    return ProvisionedMailbox('cloudflare', address, jwt)
         except Exception as primary_error:
             logger.info('Cloudflare new-address adapter unavailable: %s', primary_error)
 
