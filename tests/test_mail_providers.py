@@ -253,6 +253,31 @@ class TemporaryMailboxProviderInterfaceTest(unittest.TestCase):
         self.assertEqual(captured['params'], {'limit': 20, 'offset': 0})
 
 
+
+    def test_cloudflare_raw_mime_extracts_subject_code(self):
+        """cloudflare_temp_email list items only have raw MIME, no subject field."""
+        raw = (
+            "From: noreply@x.ai\r\n"
+            "To: user@loliko.top\r\n"
+            "Subject: SpaceXAI confirmation code: 07A-8PP\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "\r\n"
+            "<html><body>Your code is 07A-8PP</body></html>\r\n"
+        )
+        message = {
+            "id": 1,
+            "address": "user@loliko.top",
+            "raw": raw,
+            "created_at": "2026-07-22 18:00:00",
+        }
+        providers = TemporaryMailboxProviders()
+        subject, content = providers._message_content(
+            "cloudflare", message, "jwt", {"cloudflare_api_base": "https://example.com"},
+        )
+        self.assertIn("07A-8PP", subject)
+        self.assertEqual(extract_verification_code(content, subject), "07A8PP")
+
+
 class EmailManagerProviderSeamTest(unittest.TestCase):
     def test_claim_provisions_only_when_provider_has_no_ready_mailbox(self):
         db = Mock()

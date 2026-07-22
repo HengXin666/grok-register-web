@@ -160,15 +160,34 @@ class TemporaryMailboxProviders:
                 messages = self._fetch_messages(
                     provider, address, credential, settings or {},
                 )
+                if not messages:
+                    logger.info(
+                        '%s mailbox empty for %s (attempt %s/%s)',
+                        provider, address, attempt, attempts,
+                    )
                 for message in messages:
                     message_id = self._message_id(message)
                     if message_id and message_id in seen:
                         continue
                     if requested_after and self._message_is_older(message, requested_after):
+                        logger.info(
+                            '%s skip older message id=%s created=%s for %s',
+                            provider,
+                            message_id,
+                            message.get('created_at') or message.get('createdAt'),
+                            address,
+                        )
                         if message_id:
                             seen.add(message_id)
                         continue
                     if not self._recipient_matches(message, address):
+                        logger.info(
+                            '%s skip recipient mismatch id=%s address_field=%s want=%s',
+                            provider,
+                            message_id,
+                            message.get('address') or message.get('toEmail'),
+                            address,
+                        )
                         continue
                     subject, content = self._message_content(
                         provider, message, credential, settings or {},
@@ -178,11 +197,22 @@ class TemporaryMailboxProviders:
                         seen.add(message_id)
                     if code:
                         logger.info(
-                            'Verification code obtained via %s for %s',
+                            'Verification code obtained via %s for %s subject=%s',
                             provider,
                             address,
+                            (subject or '')[:80],
                         )
                         return code
+                    logger.warning(
+                        '%s message id=%s for %s had no extractable code '
+                        'subject=%r content_len=%s content_preview=%r',
+                        provider,
+                        message_id,
+                        address,
+                        (subject or '')[:120],
+                        len(content or ''),
+                        (content or '')[:160],
+                    )
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -704,11 +734,28 @@ class TemporaryMailboxProviders:
     def _message_content(self, provider, message, credential, settings):
         detail = {}
         message_id = self._message_id(message)
-        if message_id and provider in ('duckmail', 'yyds', 'cloudflare'):
+        # Prefer list payload first. cloudflare_temp_email /api/mails already
+        # embeds full MIME in ``raw``; /api/mail/<id> often 401/404 and is not
+        # required when raw is present.
+        has_raw = isinstance(message, dict) and isinstance(message.get('raw'), str) and message.get('raw').strip()
+        if message_id and provider in ('duckmail', 'yyds') and not has_raw:
             detail = self._fetch_detail(
                 provider, message_id, credential, settings,
             )
-        subject = str(detail.get('subject') or message.get('subject') or '')
+        elif message_id and provider == 'cloudflare' and not has_raw:
+            try:
+                detail = self._fetch_detail(
+                    provider, message_id, credential, settings,
+                )
+            except Exception as exc:
+                logger.info('Cloudflare mail detail fetch skipped: %s', exc)
+                detail = {}
+
+        subject = str(
+            detail.get('subject')
+            or message.get('subject')
+            or ''
+        )
         parts = []
         for source in (message, detail):
             if not isinstance(source, dict):
@@ -716,6 +763,16 @@ class TemporaryMailboxProviders:
             for field in ('text', 'raw', 'content', 'intro', 'body', 'snippet'):
                 value = source.get(field)
                 if not isinstance(value, str) or not value.strip():
+                    continue
+                if field == 'raw':
+                    raw_subject, raw_body = self._parse_raw_email(value)
+                    if raw_subject and not subject:
+                        subject = raw_subject
+                    if raw_body:
+                        parts.append(raw_body)
+                    else:
+                        # Still keep raw as fallback for subject-line extractors.
+                        parts.append(value)
                     continue
                 # Cloud Mail puts full HTML in ``content``; strip tags so
                 # extractors see the human-readable body, not CSS tokens.
@@ -730,6 +787,56 @@ class TemporaryMailboxProviders:
                 if isinstance(value, str):
                     parts.append(re.sub(r'<[^>]+>', ' ', html.unescape(value)))
         return subject, '\n'.join(parts)
+
+    @staticmethod
+    def _parse_raw_email(raw: str) -> tuple[str, str]:
+        """Extract subject + text/html body from a full MIME message."""
+        try:
+            from email import message_from_string
+            from email.header import decode_header, make_header
+        except Exception:
+            return '', raw or ''
+
+        try:
+            msg = message_from_string(raw or '')
+        except Exception:
+            return '', raw or ''
+
+        subject = ''
+        try:
+            if msg.get('Subject'):
+                subject = str(make_header(decode_header(msg.get('Subject'))))
+        except Exception:
+            subject = str(msg.get('Subject') or '')
+
+        bodies: list[str] = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = (part.get_content_type() or '').lower()
+                if ctype not in {'text/plain', 'text/html'}:
+                    continue
+                try:
+                    payload = part.get_payload(decode=True) or b''
+                    charset = part.get_content_charset() or 'utf-8'
+                    text = payload.decode(charset, errors='replace')
+                except Exception:
+                    continue
+                if ctype == 'text/html' and '<' in text:
+                    text = re.sub(r'<[^>]+>', ' ', html.unescape(text))
+                if text.strip():
+                    bodies.append(text)
+        else:
+            try:
+                payload = msg.get_payload(decode=True) or b''
+                charset = msg.get_content_charset() or 'utf-8'
+                text = payload.decode(charset, errors='replace')
+                if (msg.get_content_type() or '').lower() == 'text/html' and '<' in text:
+                    text = re.sub(r'<[^>]+>', ' ', html.unescape(text))
+                if text.strip():
+                    bodies.append(text)
+            except Exception:
+                pass
+        return subject, '\n'.join(bodies)
 
     def _fetch_detail(self, provider, message_id, credential, settings):
         if provider == 'duckmail':
