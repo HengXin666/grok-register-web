@@ -1,14 +1,19 @@
-# grok-register-web — 仅需本文件即可运行（无需源码 / 无需 build）
+# grok-register-web + Turnstile Solver
 #
-# 用法：
+# 一键：
 #   docker compose -f docker-compose.yml up -d
 #   打开 http://127.0.0.1:5000
 #
-# 镜像内置：Chromium + Xvfb（无宿主机 DISPLAY 也能 headful 浏览器回退）
-# 可选环境变量：
-#   GROK_REGISTER_PORT=5000
-#   GROK_REGISTER_SECRET_KEY=任意随机串
-#   GROK_REGISTER_IMAGE=ghcr.io/hengxin666/grok-register-web:latest
+# 设置页必配：
+#   注册后端 = protocol
+#   Turnstile = external / solver
+#   Solver URL = http://turnstile-solver:5072
+#   （容器之间用服务名，不要用 127.0.0.1）
+#
+# 镜像：
+#   控制台  ghcr.io/hengxin666/grok-register-web:latest
+#   打码器  ghcr.io/hengxin666/grok-register-web-solver:latest
+# 若 solver 镜像尚未发布，用 docker-compose.build.yml 本地构建。
 
 services:
   grok-register-web:
@@ -16,16 +21,19 @@ services:
     container_name: grok-register-web
     restart: unless-stopped
     pull_policy: always
+    depends_on:
+      turnstile-solver:
+        condition: service_started
     ports:
       - "${GROK_REGISTER_PORT:-5000}:5000"
     environment:
       GROK_REGISTER_SECRET_KEY: ${GROK_REGISTER_SECRET_KEY:-}
-      # headful under Xvfb (default in image); set true only if you want pure headless
       GROK_REGISTER_BROWSER_HEADLESS: ${GROK_REGISTER_BROWSER_HEADLESS:-false}
       GROK_REGISTER_BROWSER_PATH: ${GROK_REGISTER_BROWSER_PATH:-/usr/bin/chromium}
+      # 默认指向 compose 网络里的 solver 服务名
+      GROK_REGISTER_SOLVER_URL: ${GROK_REGISTER_SOLVER_URL:-http://turnstile-solver:5072}
     volumes:
       - grok-register-data:/app/data
-    # Chrome needs shared memory; default 64MB is too small and causes crashes.
     shm_size: "1gb"
     security_opt:
       - seccomp:unconfined
@@ -37,6 +45,30 @@ services:
       start_period: 45s
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Cloudflare Turnstile 打码（验证码求解）
+  turnstile-solver:
+    image: ${GROK_SOLVER_IMAGE:-ghcr.io/hengxin666/grok-register-web-solver:latest}
+    container_name: turnstile-solver
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      # 可选：宿主机调试用；主站容器用服务名访问，不依赖此端口
+      - "${SOLVER_PORT:-5072}:5072"
+    environment:
+      SOLVER_HOST: "0.0.0.0"
+      SOLVER_PORT: "5072"
+      SOLVER_THREADS: ${SOLVER_THREADS:-2}
+      SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-chromium}
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5072/"]
+      interval: 30s
+      timeout: 8s
+      retries: 8
+      start_period: 90s
 
 volumes:
   grok-register-data:

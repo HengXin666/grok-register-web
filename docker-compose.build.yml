@@ -1,4 +1,4 @@
-# 可选：本地从源码构建（开发用）。生产请只用 docker-compose.yml 拉 GHCR。
+# 本地构建控制台 + 打码器（GHCR 还没有 solver 镜像时用这个）
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
@@ -8,4 +8,11 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ${GROK_REGISTER_IMAGE:-grok-register-web:local}
+    pull_policy: missing
+
+  turnstile-solver:
+    build:
+      context: .
+      dockerfile: Dockerfile.solver
+    image: ${GROK_SOLVER_IMAGE:-grok-register-web-solver:local}
     pull_policy: missing

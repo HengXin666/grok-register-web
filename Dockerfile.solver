@@ -1,0 +1,87 @@
+# Turnstile Solver — solves Cloudflare Turnstile for protocol registration.
+# Uses Chromium (patchright) + Xvfb so it runs headfully in Docker without a host display.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUTF8=1 \
+    PYTHONIOENCODING=utf-8 \
+    SOLVER_HOST=0.0.0.0 \
+    SOLVER_PORT=5072 \
+    SOLVER_THREADS=2 \
+    SOLVER_BROWSER_TYPE=chromium \
+    DISPLAY=:99 \
+    LANG=C.UTF-8
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        xvfb \
+        xauth \
+        x11-utils \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+        # patchright/playwright chromium runtime deps
+        libglib2.0-0 \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libdbus-1-3 \
+        libxkbcommon0 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libasound2 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxext6 \
+        libxi6 \
+        libxtst6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Solver Python deps (no full main app stack)
+COPY requirements-solver.txt .
+RUN pip install --upgrade pip \
+    && pip install -r requirements-solver.txt \
+    && pip install patchright>=1.0 \
+    && python -m patchright install chromium \
+    && python -m patchright install-deps chromium || true
+
+COPY services/turnstile_solver /app/services/turnstile_solver
+COPY scripts/solver-entrypoint.sh /app/solver-entrypoint.sh
+
+RUN chmod +x /app/solver-entrypoint.sh \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app /home/appuser
+
+ENV HOME=/home/appuser \
+    XDG_CACHE_HOME=/home/appuser/.cache
+
+# patchright browsers usually land under the user who installed them (root);
+# copy cache for appuser when present.
+RUN mkdir -p /home/appuser/.cache \
+    && if [ -d /root/.cache/ms-playwright ]; then \
+         cp -a /root/.cache/ms-playwright /home/appuser/.cache/ \
+         && chown -R appuser:appuser /home/appuser/.cache; \
+       fi
+
+USER appuser
+
+EXPOSE 5072
+
+HEALTHCHECK --interval=30s --timeout=8s --start-period=60s --retries=5 \
+  CMD curl -fsS "http://127.0.0.1:${SOLVER_PORT:-5072}/" >/dev/null || exit 1
+
+ENTRYPOINT ["/app/solver-entrypoint.sh"]

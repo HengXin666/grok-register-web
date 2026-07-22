@@ -215,18 +215,26 @@ class TurnstileAPIServer:
 
             browser_args = [
                 "--window-position=0,0",
-                "--force-device-scale-factor=1"
+                "--force-device-scale-factor=1",
+                # Docker / Xvfb
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--mute-audio",
             ]
             if config['useragent']:
                 browser_args.append(f"--user-agent={config['useragent']}")
 
             browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
+                launch_kwargs = {
+                    "headless": self.headless,
+                    "args": browser_args,
+                }
+                # Bundled chromium has no named channel; only chrome/msedge use channel=
+                if self.browser_type in ('chrome', 'msedge'):
+                    launch_kwargs["channel"] = self.browser_type
+                browser = await playwright.chromium.launch(**launch_kwargs)
             elif self.browser_type == "camoufox" and camoufox:
                 browser = await camoufox.start()
 

@@ -78,6 +78,13 @@ curl -fsSL -o docker-compose.yml \
 
 docker compose -f docker-compose.yml up -d
 # 浏览器打开 http://127.0.0.1:5000
+#
+# 包含：
+#   grok-register-web  控制台 :5000
+#   turnstile-solver   验证码打码 :5072
+#
+# 设置页：注册后端=protocol，Turnstile=external，
+# Solver URL = http://turnstile-solver:5072
 ```
 
 镜像：`ghcr.io/hengxin666/grok-register-web:latest`（GitHub Actions 自动构建）。  
