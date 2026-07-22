@@ -156,7 +156,8 @@ class BrowserManager:
             if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
                 raise BrowserError(
                     'Headful Chrome requires DISPLAY/WAYLAND_DISPLAY on Linux. '
-                    'Start the application with scripts/run_with_xvfb.sh.'
+                    'In Docker use the official image entrypoint (starts Xvfb) '
+                    'or run scripts/run_with_xvfb.sh / scripts/docker-entrypoint.sh.'
                 )
         if self.proxy:
             validate_proxy_endpoint(self.proxy)

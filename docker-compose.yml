@@ -4,15 +4,11 @@
 #   docker compose -f docker-compose.yml up -d
 #   打开 http://127.0.0.1:5000
 #
+# 镜像内置：Chromium + Xvfb（无宿主机 DISPLAY 也能 headful 浏览器回退）
 # 可选环境变量：
 #   GROK_REGISTER_PORT=5000
 #   GROK_REGISTER_SECRET_KEY=任意随机串
 #   GROK_REGISTER_IMAGE=ghcr.io/hengxin666/grok-register-web:latest
-#
-# 说明：
-# - 镜像由 GitHub Actions 推到 GHCR，compose 只 pull，不本地构建。
-# - 推荐：协议注册 + 外置 Turnstile Solver（在网页设置里配置 solver URL）。
-# - 容器内不要指望 headful Chrome（无 DISPLAY）。
 
 services:
   grok-register-web:
@@ -24,16 +20,22 @@ services:
       - "${GROK_REGISTER_PORT:-5000}:5000"
     environment:
       GROK_REGISTER_SECRET_KEY: ${GROK_REGISTER_SECRET_KEY:-}
+      # headful under Xvfb (default in image); set true only if you want pure headless
+      GROK_REGISTER_BROWSER_HEADLESS: ${GROK_REGISTER_BROWSER_HEADLESS:-false}
+      GROK_REGISTER_BROWSER_PATH: ${GROK_REGISTER_BROWSER_PATH:-/usr/bin/chromium}
     volumes:
       - grok-register-data:/app/data
+    # Chrome needs shared memory; default 64MB is too small and causes crashes.
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5000/"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 25s
+      start_period: 45s
     extra_hosts:
-      # 便于容器访问宿主机上的 Solver / 代理（Linux Docker）
       - "host.docker.internal:host-gateway"
 
 volumes:

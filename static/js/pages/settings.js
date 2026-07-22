@@ -123,6 +123,13 @@ export async function render(container) {
     const grok2apiUpload = s.grok2api_auto_upload === 'true' ? 'true' : 'false';
     const grok2apiProbe = s.grok2api_probe_chat === 'true' ? 'true' : 'false';
     const sub2apiUpload = s.sub2api_auto_upload === 'true' ? 'true' : 'false';
+    // Map legacy/password aliases so the select shows Custom Auth correctly.
+    const rawCfAuth = String(s.cloudflare_auth_mode || 'none').toLowerCase().replace(/[\s_]+/g, '-');
+    const cfAuthMode = (
+        ['password', 'custom', 'custom-auth', 'admin', 'admin-password'].includes(rawCfAuth)
+            ? 'custom'
+            : (s.cloudflare_auth_mode || 'none')
+    );
     const cpaAuto = s.cpa_auto_export === 'true' ? 'true' : 'false';
     const cpaProbe = s.cpa_probe_chat === 'false' ? 'false' : 'true';
     const cpaPool = s.cpa_pool_enabled === 'true' ? 'true' : 'false';
@@ -169,18 +176,22 @@ export async function render(container) {
                     </div>
                 `)}
                 ${providerPanel('cloudflare', `
+                    <div class="settings-callout" style="margin:0 0 12px;padding:12px 14px;border:1px solid var(--border, #334);border-radius:10px;background:rgba(56,189,248,.06)">
+                        <div style="font-weight:600;margin-bottom:4px">Cloudflare Temp Email · Custom Auth</div>
+                        <div class="helper-text" style="margin:0">若 Worker 后台开启了 <b>Custom Auth / 管理密码</b>：鉴权选 <code>custom</code>，下方密码框填该密码。选其它邮箱服务时此区域会隐藏——请先把「注册邮箱服务」切到 Cloudflare Temp Email。</div>
+                    </div>
                     <div class="settings-grid">
-                        ${field('s-cloudflare-api-base', 'Cloudflare 邮箱 API Base', s.cloudflare_api_base || '', { type: 'text', mono: true, placeholder: 'https://temp-mail.example.com' })}
-                        ${selectField('s-cloudflare-auth-mode', '鉴权方式', s.cloudflare_auth_mode || 'none', [
-                            { value: 'none', label: 'none（公开接口）' },
-                            { value: 'custom', label: 'custom / password（推荐 · x-admin-auth）' },
+                        ${field('s-cloudflare-api-base', 'API Base（Worker 域名）', s.cloudflare_api_base || '', { type: 'text', mono: true, placeholder: 'https://temp-mail.example.com' })}
+                        ${selectField('s-cloudflare-auth-mode', '鉴权方式（Custom Auth 选 custom）', cfAuthMode, [
+                            { value: 'custom', label: '★ Custom Auth / 密码（x-admin-auth）' },
                             { value: 'x-admin-auth', label: 'x-admin-auth' },
+                            { value: 'none', label: 'none（公开接口，无密码）' },
                             { value: 'query-key', label: 'query-key（?key=）' },
                             { value: 'bearer', label: 'bearer' },
                             { value: 'x-api-key', label: 'x-api-key' },
                             { value: 'basic', label: 'basic（user:pass）' },
                         ], { mono: true })}
-                        ${field('s-cloudflare-api-key', 'API Key / Admin Password / Custom Auth 密码', s.cloudflare_api_key || '', { type: 'password', helper: 'cloudflare_temp_email 开启 Custom Auth 时，鉴权选 custom，这里填管理密码。' })}
+                        ${field('s-cloudflare-api-key', 'Custom Auth 密码 / Admin Password', s.cloudflare_api_key || '', { type: 'password', helper: '对应 cloudflare_temp_email 后台的 Custom Auth 密码；会以 x-admin-auth 请求头发送。' })}
                         ${field('s-cloudflare-default-domains', '默认域名（逗号分隔）', s.cloudflare_default_domains || '', { type: 'text', mono: true, placeholder: 'mail.example.com, mail2.example.com' })}
                         ${field('s-cloudflare-path-domains', '域名路径', s.cloudflare_path_domains || '/api/domains', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-accounts', '创建邮箱路径', s.cloudflare_path_accounts || '/api/new_address', { type: 'text', mono: true })}
