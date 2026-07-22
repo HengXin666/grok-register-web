@@ -317,8 +317,13 @@ class TemporaryMailboxProviders:
         mode = TemporaryMailboxProviders._normalize_cloudflare_auth_mode(
             settings.get('cloudflare_auth_mode', 'none')
         )
-        if mode == 'query-key' and settings.get('cloudflare_api_key'):
-            result['key'] = settings['cloudflare_api_key']
+        if mode == 'query-key':
+            key = TemporaryMailboxProviders._cloudflare_admin_password(
+                {'cloudflare_admin_password': settings.get('cloudflare_admin_password'),
+                 'cloudflare_api_key': settings.get('cloudflare_api_key')}
+            ) or str(settings.get('cloudflare_api_key') or '').strip()
+            if key:
+                result['key'] = key
         return result
 
     @staticmethod
@@ -405,19 +410,64 @@ class TemporaryMailboxProviders:
                 token = (token_data.get('data') or {}).get('token') or ''
         return ProvisionedMailbox('yyds', address, token)
 
+    @staticmethod
+    def _cloudflare_admin_password(settings):
+        """ADMIN_PASSWORDS — admin API credential (x-admin-auth)."""
+        for key in ('cloudflare_admin_password', 'cloudflare_api_key'):
+            value = str(settings.get(key, '') or '').strip()
+            if value:
+                return value
+        return ''
+
+    @staticmethod
+    def _cloudflare_custom_password(settings):
+        """PASSWORDS — Custom Auth password (only when mode is custom/password)."""
+        return str(settings.get('cloudflare_custom_password', '') or '').strip()
+
     def _cloudflare_headers(self, settings, json_body=False, token=''):
         """Headers for Cloudflare Temp Email admin / mailbox APIs.
 
-        Always attach configured admin/custom password auth when present — not
-        only for ``/admin/new_address``. Public ``/api/new_address`` on locked
-        deployments still requires Custom Auth / x-admin-auth.
+        Two independent secrets (matches cloudflare_temp_email Worker env):
+          - ADMIN_PASSWORDS → always sent as ``x-admin-auth`` when set
+          - PASSWORDS (Custom Auth) → only when auth mode is custom/password;
+            also sent as ``x-custom-auth`` / falls back into admin header when
+            admin password is empty.
         """
-        return self._auth_headers(
-            token=str(token or '').strip(),
-            api_key=str(settings.get('cloudflare_api_key', '') or '').strip(),
-            mode=str(settings.get('cloudflare_auth_mode', 'none') or 'none'),
-            json_body=json_body,
+        headers = {'Content-Type': 'application/json'} if json_body else {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+            return headers
+
+        mode = self._normalize_cloudflare_auth_mode(
+            settings.get('cloudflare_auth_mode', 'none')
         )
+        admin = self._cloudflare_admin_password(settings)
+        custom = self._cloudflare_custom_password(settings)
+
+        # Admin password always authenticates admin APIs when present.
+        if admin:
+            headers['x-admin-auth'] = admin
+            headers.setdefault('Authorization', f'Bearer {admin}')
+
+        # Custom Auth (PASSWORDS) only when user selected password/custom mode.
+        if mode in {'custom', 'password', 'x-admin-auth'} and custom:
+            headers['x-custom-auth'] = custom
+            # Some worker builds only accept Custom Auth via x-admin-auth.
+            if not admin:
+                headers['x-admin-auth'] = custom
+                headers.setdefault('Authorization', f'Bearer {custom}')
+
+        if mode == 'x-api-key' and admin:
+            headers['X-API-Key'] = admin
+        elif mode == 'basic' and admin:
+            import base64
+            raw = admin if ':' in admin else f':{admin}'
+            headers['Authorization'] = (
+                f'Basic {base64.b64encode(raw.encode("utf-8")).decode("ascii")}'
+            )
+        elif mode == 'bearer' and admin and 'Authorization' not in headers:
+            headers['Authorization'] = f'Bearer {admin}'
+        return headers
 
     def _next_cloudflare_domain(self, settings):
         domains = [
@@ -460,9 +510,15 @@ class TemporaryMailboxProviders:
         auth_mode = self._normalize_cloudflare_auth_mode(
             settings.get('cloudflare_auth_mode', 'none')
         )
-        if auth_mode not in {'none', ''} and not str(settings.get('cloudflare_api_key') or '').strip():
+        admin = self._cloudflare_admin_password(settings)
+        custom = self._cloudflare_custom_password(settings)
+        if auth_mode in {'custom', 'password'} and not custom and not admin:
             raise MailProviderError(
-                'Cloudflare Custom Auth / API password is required when auth mode is not none'
+                'Cloudflare Custom Auth requires PASSWORDS (Custom Auth) or ADMIN_PASSWORDS'
+            )
+        if auth_mode not in {'none', '', 'custom', 'password'} and not admin:
+            raise MailProviderError(
+                'Cloudflare admin password (ADMIN_PASSWORDS) is required for this auth mode'
             )
         try:
             data = self._json(

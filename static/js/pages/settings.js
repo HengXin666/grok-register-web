@@ -180,46 +180,61 @@ export async function render(container) {
                 `)}
                 ${providerPanel('cloudflare', `
                     <div class="settings-callout" style="margin:0 0 14px;padding:12px 14px;border:1px solid #38bdf8;border-radius:10px;background:rgba(56,189,248,.08)">
-                        <div style="font-weight:700;margin-bottom:6px;font-size:15px">① 先选邮箱服务 = Cloudflare Temp Email，本区才会显示</div>
-                        <div class="helper-text" style="margin:0">cloudflare_temp_email 的 <b>Custom Auth 管理密码</b> 填在下面红色边框的输入框里（必填，除非鉴权选 none）。</div>
+                        <div style="font-weight:700;margin-bottom:6px">Cloudflare Temp Email 凭证（两个密码，分开填）</div>
+                        <div class="helper-text" style="margin:0">
+                            对应 Worker：<code>ADMIN_PASSWORDS</code>（管理）与 <code>PASSWORDS</code>（Custom Auth，仅密码模式显示）。
+                        </div>
                     </div>
 
-                    <div class="form-group" style="margin-bottom:16px">
-                        <label for="s-cloudflare-api-base"><b>API Base</b>（Worker 完整域名，不要漏 https）</label>
+                    <div class="form-group" style="margin-bottom:14px">
+                        <label for="s-cloudflare-api-base"><b>API Base</b>（Worker 域名）</label>
                         <input type="text" class="form-input mono" id="s-cloudflare-api-base"
                             value="${esc(s.cloudflare_api_base || '')}"
                             placeholder="https://temp-mail.example.com"
                             autocomplete="off" spellcheck="false">
                     </div>
 
-                    <div class="form-group" style="margin-bottom:16px;padding:14px;border:2px solid #f87171;border-radius:12px;background:rgba(248,113,113,.06)">
-                        <label for="s-cloudflare-api-key" style="display:block;font-weight:700;font-size:15px;margin-bottom:8px;color:#fca5a5">
-                            ② Custom Auth 密码（凭证 / Admin Password）— 必须填这里
+                    <div class="form-group" style="margin-bottom:14px;padding:12px;border:1px solid #94a3b8;border-radius:10px">
+                        <label for="s-cloudflare-admin-password" style="display:block;font-weight:700;margin-bottom:8px">
+                            ① ADMIN_PASSWORDS（管理密码）
                         </label>
-                        <input type="text" class="form-input mono" id="s-cloudflare-api-key"
-                            value="${esc(s.cloudflare_api_key || '')}"
-                            placeholder="粘贴 cloudflare_temp_email 后台 Custom Auth 密码"
+                        <input type="text" class="form-input mono" id="s-cloudflare-admin-password"
+                            value="${esc(s.cloudflare_admin_password || s.cloudflare_api_key || '')}"
+                            placeholder="Worker 环境变量 ADMIN_PASSWORDS"
                             autocomplete="off" spellcheck="false"
-                            style="min-height:44px;font-size:15px">
-                        <div class="helper-text" style="margin-top:8px">保存后以请求头 <code>x-admin-auth: &lt;密码&gt;</code> 发送。这就是凭证密码输入框。</div>
+                            style="min-height:42px">
+                        <div class="helper-text" style="margin-top:6px">始终显示。有值时请求头带 <code>x-admin-auth</code>。</div>
                     </div>
 
-                    <div class="form-group" style="margin-bottom:16px">
+                    <div class="form-group" style="margin-bottom:14px">
                         <label for="s-cloudflare-auth-mode"><b>鉴权方式</b></label>
                         <select class="form-input mono" id="s-cloudflare-auth-mode" style="min-height:40px">
-                            <option value="custom"${cfAuthMode === 'custom' ? ' selected' : ''}>custom — Custom Auth / 密码（推荐）</option>
-                            <option value="x-admin-auth"${cfAuthMode === 'x-admin-auth' ? ' selected' : ''}>x-admin-auth</option>
-                            <option value="none"${cfAuthMode === 'none' ? ' selected' : ''}>none — 无密码公开接口</option>
+                            <option value="none"${cfAuthMode === 'none' ? ' selected' : ''}>none — 不用 Custom Auth</option>
+                            <option value="custom"${(cfAuthMode === 'custom' || cfAuthMode === 'password') ? ' selected' : ''}>password / Custom Auth — 显示 PASSWORDS</option>
+                            <option value="x-admin-auth"${cfAuthMode === 'x-admin-auth' ? ' selected' : ''}>仅 x-admin-auth（只用 ADMIN）</option>
                             <option value="query-key"${cfAuthMode === 'query-key' ? ' selected' : ''}>query-key（?key=）</option>
                             <option value="bearer"${cfAuthMode === 'bearer' ? ' selected' : ''}>bearer</option>
                             <option value="x-api-key"${cfAuthMode === 'x-api-key' ? ' selected' : ''}>x-api-key</option>
-                            <option value="basic"${cfAuthMode === 'basic' ? ' selected' : ''}>basic（user:pass）</option>
+                            <option value="basic"${cfAuthMode === 'basic' ? ' selected' : ''}>basic</option>
                         </select>
-                        <div class="helper-text">Worker 开了 Custom Auth 就选 custom，并把上面密码框填上。</div>
+                        <div class="helper-text">只有选「password / Custom Auth」时，才会出现下面的 PASSWORDS 输入框。</div>
+                    </div>
+
+                    <div class="form-group" id="cloudflare-custom-password-wrap"
+                        style="margin-bottom:14px;padding:12px;border:2px solid #f87171;border-radius:10px;background:rgba(248,113,113,.06);${(cfAuthMode === 'custom' || cfAuthMode === 'password') ? '' : 'display:none'}">
+                        <label for="s-cloudflare-custom-password" style="display:block;font-weight:700;margin-bottom:8px;color:#fca5a5">
+                            ② PASSWORDS（Custom Auth 密码）
+                        </label>
+                        <input type="text" class="form-input mono" id="s-cloudflare-custom-password"
+                            value="${esc(s.cloudflare_custom_password || '')}"
+                            placeholder="Worker 环境变量 PASSWORDS"
+                            autocomplete="off" spellcheck="false"
+                            style="min-height:42px">
+                        <div class="helper-text" style="margin-top:6px">仅密码 / Custom Auth 模式需要填写。</div>
                     </div>
 
                     <div class="settings-grid">
-                        ${field('s-cloudflare-default-domains', '默认域名（逗号分隔）', s.cloudflare_default_domains || '', { type: 'text', mono: true, placeholder: 'mail.example.com, mail2.example.com' })}
+                        ${field('s-cloudflare-default-domains', '默认域名（逗号分隔）', s.cloudflare_default_domains || '', { type: 'text', mono: true, placeholder: 'mail.example.com' })}
                         ${field('s-cloudflare-path-domains', '域名路径', s.cloudflare_path_domains || '/api/domains', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-accounts', '创建邮箱路径', s.cloudflare_path_accounts || '/api/new_address', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-token', 'Token 路径', s.cloudflare_path_token || '/api/token', { type: 'text', mono: true })}
@@ -500,6 +515,9 @@ export async function render(container) {
     initSelects(container);
     bindChoiceCards(container);
     updateProviderSettings(container);
+    container.querySelector('#s-cloudflare-auth-mode')?.addEventListener('change', () => {
+        updateCloudflareCustomPasswordVisibility(container);
+    });
     updateBackendSettings(container);
     bindBackendChoices(container);
 
@@ -543,11 +561,20 @@ function bindChoiceCards(root) {
     });
 }
 
+function updateCloudflareCustomPasswordVisibility(root = document) {
+    const mode = root.querySelector('#s-cloudflare-auth-mode')?.value || 'none';
+    const wrap = root.querySelector('#cloudflare-custom-password-wrap');
+    if (!wrap) return;
+    wrap.style.display = (mode === 'custom' || mode === 'password') ? '' : 'none';
+}
+
 function updateProviderSettings(root) {
+
     const provider = root.querySelector('#s-email-provider')?.value || 'microsoft';
     root.querySelectorAll('.mail-provider-settings').forEach((panel) => {
         panel.hidden = panel.dataset.provider !== provider;
     });
+    updateCloudflareCustomPasswordVisibility(root);
 }
 
 function currentRegistrationBackend(root = document) {
@@ -740,8 +767,10 @@ function collectSettings() {
         yyds_api_key: val('s-yyds-api-key').trim(),
         yyds_jwt: val('s-yyds-jwt').trim(),
         cloudflare_api_base: val('s-cloudflare-api-base').trim(),
-        cloudflare_api_key: val('s-cloudflare-api-key').trim(),
-        cloudflare_auth_mode: val('s-cloudflare-auth-mode'),
+        cloudflare_admin_password: val('s-cloudflare-admin-password').trim(),
+        cloudflare_custom_password: val('s-cloudflare-custom-password').trim(),
+        cloudflare_api_key: val('s-cloudflare-admin-password').trim(),
+        cloudflare_auth_mode: val('s-cloudflare-auth-mode') || 'none',
         cloudflare_path_domains: val('s-cloudflare-path-domains').trim(),
         cloudflare_path_accounts: val('s-cloudflare-path-accounts').trim(),
         cloudflare_path_token: val('s-cloudflare-path-token').trim(),

@@ -29,6 +29,11 @@ DEFAULT_SETTINGS = {
     'yyds_api_key': '',
     'yyds_jwt': '',
     'cloudflare_api_base': '',
+    # ADMIN_PASSWORDS (admin API / x-admin-auth) — always used when set
+    'cloudflare_admin_password': '',
+    # PASSWORDS (Custom Auth) — only used when auth mode is password/custom
+    'cloudflare_custom_password': '',
+    # legacy single field; migrated into admin password when empty
     'cloudflare_api_key': '',
     'cloudflare_auth_mode': 'none',
     'cloudflare_path_domains': '/api/domains',

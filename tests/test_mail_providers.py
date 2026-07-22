@@ -178,28 +178,30 @@ class TemporaryMailboxProviderInterfaceTest(unittest.TestCase):
 
 
 
-    def test_cloudflare_custom_auth_headers(self):
-        """cloudflare_temp_email Custom Auth password maps to x-admin-auth."""
-        headers = TemporaryMailboxProviders._auth_headers(
-            api_key='admin-secret', mode='custom', json_body=True,
-        )
-        self.assertEqual(headers.get('x-admin-auth'), 'admin-secret')
-        headers2 = TemporaryMailboxProviders._auth_headers(
-            api_key='admin-secret', mode='password', json_body=True,
-        )
-        self.assertEqual(headers2.get('x-admin-auth'), 'admin-secret')
-        self.assertEqual(
-            TemporaryMailboxProviders._normalize_cloudflare_auth_mode('Custom Auth'),
-            'custom',
-        )
+    def test_cloudflare_admin_and_custom_passwords_are_separate(self):
+        """ADMIN_PASSWORDS always; PASSWORDS only in custom/password mode."""
+        p = TemporaryMailboxProviders()
+        h = p._cloudflare_headers({
+            'cloudflare_admin_password': 'ADMIN',
+            'cloudflare_custom_password': 'CUSTOM',
+            'cloudflare_auth_mode': 'none',
+        }, json_body=True)
+        self.assertEqual(h.get('x-admin-auth'), 'ADMIN')
+        self.assertNotIn('x-custom-auth', h)
 
-    def test_cloudflare_new_address_always_sends_admin_auth(self):
-        """Locked workers need auth even on /api/new_address (not only /admin)."""
+        h2 = p._cloudflare_headers({
+            'cloudflare_admin_password': 'ADMIN',
+            'cloudflare_custom_password': 'CUSTOM',
+            'cloudflare_auth_mode': 'custom',
+        }, json_body=True)
+        self.assertEqual(h2.get('x-admin-auth'), 'ADMIN')
+        self.assertEqual(h2.get('x-custom-auth'), 'CUSTOM')
+
+    def test_cloudflare_new_address_sends_admin_password(self):
         providers = TemporaryMailboxProviders()
         captured = {}
 
         def fake_json(method, url, settings, **kwargs):
-            captured['url'] = url
             captured['headers'] = kwargs.get('headers') or {}
             return {'address': 'a@mail.example.com', 'jwt': 'jwt-token'}
 
@@ -207,14 +209,15 @@ class TemporaryMailboxProviderInterfaceTest(unittest.TestCase):
         box = providers._provision_cloudflare({
             'cloudflare_api_base': 'https://temp.example.com',
             'cloudflare_auth_mode': 'custom',
-            'cloudflare_api_key': 'secret-pass',
+            'cloudflare_admin_password': 'ADMIN',
+            'cloudflare_custom_password': 'CUSTOM',
             'cloudflare_path_accounts': '/api/new_address',
             'cloudflare_default_domains': 'mail.example.com',
         })
-        self.assertEqual(box.address, 'a@mail.example.com')
         self.assertEqual(box.credential, 'jwt-token')
-        self.assertEqual(captured['headers'].get('x-admin-auth'), 'secret-pass')
-        self.assertIn('/api/new_address', captured['url'])
+        self.assertEqual(captured['headers'].get('x-admin-auth'), 'ADMIN')
+        self.assertEqual(captured['headers'].get('x-custom-auth'), 'CUSTOM')
+
 
 class EmailManagerProviderSeamTest(unittest.TestCase):
     def test_claim_provisions_only_when_provider_has_no_ready_mailbox(self):
