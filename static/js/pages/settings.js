@@ -161,6 +161,9 @@ export async function render(container) {
                         { value: 'cloud_mail', label: 'Cloud Mail API（自动创建）' },
                     ], { helper: 'Microsoft 使用账号库 OAuth 凭证；临时邮箱会在注册轮次开始前自动创建并入库。' })}
                 </div>
+                <div class="helper-text" style="margin:8px 0 12px">
+                    使用 Cloudflare Temp Email 时：请在上方把「注册邮箱服务」切换为 <b>Cloudflare Temp Email</b>，才会出现 <b>Custom Auth 密码输入框</b>。
+                </div>
 
                 ${providerPanel('duckmail', `
                     <div class="settings-grid">
@@ -176,22 +179,46 @@ export async function render(container) {
                     </div>
                 `)}
                 ${providerPanel('cloudflare', `
-                    <div class="settings-callout" style="margin:0 0 12px;padding:12px 14px;border:1px solid var(--border, #334);border-radius:10px;background:rgba(56,189,248,.06)">
-                        <div style="font-weight:600;margin-bottom:4px">Cloudflare Temp Email · Custom Auth</div>
-                        <div class="helper-text" style="margin:0">若 Worker 后台开启了 <b>Custom Auth / 管理密码</b>：鉴权选 <code>custom</code>，下方密码框填该密码。选其它邮箱服务时此区域会隐藏——请先把「注册邮箱服务」切到 Cloudflare Temp Email。</div>
+                    <div class="settings-callout" style="margin:0 0 14px;padding:12px 14px;border:1px solid #38bdf8;border-radius:10px;background:rgba(56,189,248,.08)">
+                        <div style="font-weight:700;margin-bottom:6px;font-size:15px">① 先选邮箱服务 = Cloudflare Temp Email，本区才会显示</div>
+                        <div class="helper-text" style="margin:0">cloudflare_temp_email 的 <b>Custom Auth 管理密码</b> 填在下面红色边框的输入框里（必填，除非鉴权选 none）。</div>
                     </div>
+
+                    <div class="form-group" style="margin-bottom:16px">
+                        <label for="s-cloudflare-api-base"><b>API Base</b>（Worker 完整域名，不要漏 https）</label>
+                        <input type="text" class="form-input mono" id="s-cloudflare-api-base"
+                            value="${esc(s.cloudflare_api_base || '')}"
+                            placeholder="https://temp-mail.example.com"
+                            autocomplete="off" spellcheck="false">
+                    </div>
+
+                    <div class="form-group" style="margin-bottom:16px;padding:14px;border:2px solid #f87171;border-radius:12px;background:rgba(248,113,113,.06)">
+                        <label for="s-cloudflare-api-key" style="display:block;font-weight:700;font-size:15px;margin-bottom:8px;color:#fca5a5">
+                            ② Custom Auth 密码（凭证 / Admin Password）— 必须填这里
+                        </label>
+                        <input type="text" class="form-input mono" id="s-cloudflare-api-key"
+                            value="${esc(s.cloudflare_api_key || '')}"
+                            placeholder="粘贴 cloudflare_temp_email 后台 Custom Auth 密码"
+                            autocomplete="off" spellcheck="false"
+                            style="min-height:44px;font-size:15px">
+                        <div class="helper-text" style="margin-top:8px">保存后以请求头 <code>x-admin-auth: &lt;密码&gt;</code> 发送。这就是凭证密码输入框。</div>
+                    </div>
+
+                    <div class="form-group" style="margin-bottom:16px">
+                        <label for="s-cloudflare-auth-mode"><b>鉴权方式</b></label>
+                        <select class="form-input mono" id="s-cloudflare-auth-mode" style="min-height:40px">
+                            <option value="custom"${cfAuthMode === 'custom' ? ' selected' : ''}>custom — Custom Auth / 密码（推荐）</option>
+                            <option value="x-admin-auth"${cfAuthMode === 'x-admin-auth' ? ' selected' : ''}>x-admin-auth</option>
+                            <option value="none"${cfAuthMode === 'none' ? ' selected' : ''}>none — 无密码公开接口</option>
+                            <option value="query-key"${cfAuthMode === 'query-key' ? ' selected' : ''}>query-key（?key=）</option>
+                            <option value="bearer"${cfAuthMode === 'bearer' ? ' selected' : ''}>bearer</option>
+                            <option value="x-api-key"${cfAuthMode === 'x-api-key' ? ' selected' : ''}>x-api-key</option>
+                            <option value="basic"${cfAuthMode === 'basic' ? ' selected' : ''}>basic（user:pass）</option>
+                        </select>
+                        <div class="helper-text">Worker 开了 Custom Auth 就选 custom，并把上面密码框填上。</div>
+                    </div>
+
                     <div class="settings-grid">
-                        ${field('s-cloudflare-api-base', 'API Base（Worker 域名）', s.cloudflare_api_base || '', { type: 'text', mono: true, placeholder: 'https://temp-mail.example.com' })}
-                        ${selectField('s-cloudflare-auth-mode', '鉴权方式（Custom Auth 选 custom）', cfAuthMode, [
-                            { value: 'custom', label: '★ Custom Auth / 密码（x-admin-auth）' },
-                            { value: 'x-admin-auth', label: 'x-admin-auth' },
-                            { value: 'none', label: 'none（公开接口，无密码）' },
-                            { value: 'query-key', label: 'query-key（?key=）' },
-                            { value: 'bearer', label: 'bearer' },
-                            { value: 'x-api-key', label: 'x-api-key' },
-                            { value: 'basic', label: 'basic（user:pass）' },
-                        ], { mono: true })}
-                        ${field('s-cloudflare-api-key', 'Custom Auth 密码 / Admin Password', s.cloudflare_api_key || '', { type: 'password', helper: '对应 cloudflare_temp_email 后台的 Custom Auth 密码；会以 x-admin-auth 请求头发送。' })}
                         ${field('s-cloudflare-default-domains', '默认域名（逗号分隔）', s.cloudflare_default_domains || '', { type: 'text', mono: true, placeholder: 'mail.example.com, mail2.example.com' })}
                         ${field('s-cloudflare-path-domains', '域名路径', s.cloudflare_path_domains || '/api/domains', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-accounts', '创建邮箱路径', s.cloudflare_path_accounts || '/api/new_address', { type: 'text', mono: true })}
