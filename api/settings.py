@@ -126,4 +126,37 @@ def init_settings_api(db):
             ),
         }), (200 if online else 503)
 
+
+    @settings_bp.route('/api/settings/cloudflare-mail/test', methods=['POST'])
+    def test_cloudflare_mail():
+        """Live probe: create mailbox + list mails, return full debug report."""
+        data = request.get_json(silent=True) or {}
+        # Prefer form/body overrides, fall back to saved settings.
+        settings = dict(db.get_settings())
+        for key in (
+            'cloudflare_api_base', 'cloudflare_admin_password', 'cloudflare_custom_password',
+            'cloudflare_api_key', 'cloudflare_auth_mode', 'cloudflare_default_domains',
+            'cloudflare_path_accounts', 'cloudflare_path_messages', 'cloudflare_path_domains',
+            'cloudflare_path_token', 'browser_proxy',
+        ):
+            if key in data and data[key] is not None:
+                settings[key] = data[key]
+        # Unsaved form fields from UI take priority when non-empty string provided
+        from core.mail_providers import TemporaryMailboxProviders
+        providers = TemporaryMailboxProviders()
+        report = providers.diagnose_cloudflare_mail(
+            settings,
+            create_mailbox=data.get('create_mailbox', True) is not False,
+            list_mails=data.get('list_mails', True) is not False,
+        )
+        return jsonify({
+            'success': bool(report.get('ok')),
+            'data': report,
+            'message': (
+                'Cloudflare 邮箱联调通过'
+                if report.get('ok')
+                else 'Cloudflare 邮箱联调失败，见 steps / hints'
+            ),
+        }), (200 if report.get('ok') else 200)
+
     return settings_bp

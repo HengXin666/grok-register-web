@@ -425,13 +425,37 @@ class TemporaryMailboxProviders:
         return str(settings.get('cloudflare_custom_password', '') or '').strip()
 
     @staticmethod
-    def _cloudflare_mailbox_headers(credential, json_body=False):
-        """Headers for mailbox JWT access (/api/mails). Never mix admin passwords here."""
+    def _cloudflare_mailbox_headers(credential, settings=None, json_body=False):
+        """Headers for mailbox access (/api/mails).
+
+        cloudflare_temp_email worker middleware (worker.ts):
+          1) If PASSWORDS (Custom Auth) is configured, EVERY non-open_api path
+             requires header ``x-custom-auth: <password>`` — including /api/mails.
+          2) /api/* (except new_address / address_login) then requires a valid
+             mailbox JWT via ``Authorization: Bearer <jwt>``.
+
+        So with Custom Auth enabled, both headers are required. Admin password
+        alone is not enough for /api/mails.
+        """
         headers = {'Content-Type': 'application/json'} if json_body else {}
         token = str(credential or '').strip()
         if not token:
             raise MailProviderError('Cloudflare mailbox JWT is empty')
         headers['Authorization'] = f'Bearer {token}'
+
+        settings = settings or {}
+        # Always attach Custom Auth when configured — worker rejects without it.
+        custom = TemporaryMailboxProviders._cloudflare_custom_password(settings)
+        if not custom:
+            # Legacy: some installs only stored PASSWORDS in cloudflare_api_key
+            # with auth_mode=custom/password.
+            mode = TemporaryMailboxProviders._normalize_cloudflare_auth_mode(
+                settings.get('cloudflare_auth_mode', 'none')
+            )
+            if mode in {'custom', 'password'}:
+                custom = TemporaryMailboxProviders._cloudflare_admin_password(settings)
+        if custom:
+            headers['x-custom-auth'] = custom
         return headers
 
     def _cloudflare_headers(self, settings, json_body=False, token=''):
@@ -658,11 +682,10 @@ class TemporaryMailboxProviders:
             if not base:
                 raise MailProviderError('Cloudflare cloudflare_api_base is required')
             path = self._path(settings, 'cloudflare_path_messages', '/api/mails')
-            # Mailbox JWT only — admin/custom passwords must NOT override Bearer.
-            # cloudflare_temp_email: Authorization: Bearer <jwt> for /api/mails.
+            # Need BOTH: Bearer <mailbox jwt> + x-custom-auth when PASSWORDS is set.
             data = self._json(
                 'GET', f'{base}{path}', settings,
-                headers=self._cloudflare_mailbox_headers(credential),
+                headers=self._cloudflare_mailbox_headers(credential, settings),
                 params={'limit': 20, 'offset': 0},
             )
             return self._pick_list(data)
@@ -730,7 +753,7 @@ class TemporaryMailboxProviders:
                 try:
                     data = self._json(
                         'GET', url, settings,
-                        headers=self._cloudflare_mailbox_headers(credential),
+                        headers=self._cloudflare_mailbox_headers(credential, settings),
                     )
                     if isinstance(data, dict) and isinstance(data.get('data'), dict):
                         return data['data']
@@ -793,3 +816,186 @@ class TemporaryMailboxProviders:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+
+    def diagnose_cloudflare_mail(self, settings, *, create_mailbox=True, list_mails=True):
+        """Run a live Cloudflare Temp Email connectivity probe with full debug info.
+
+        Returns a structured report for the settings UI — does not raise for
+        expected HTTP failures so the operator can see status codes and headers.
+        """
+        import time as _time
+        report = {
+            'ok': False,
+            'steps': [],
+            'settings_snapshot': {},
+            'hints': [],
+        }
+        settings = dict(settings or {})
+        base = self._base(settings, 'cloudflare_api_base')
+        mode = self._normalize_cloudflare_auth_mode(settings.get('cloudflare_auth_mode', 'none'))
+        admin = self._cloudflare_admin_password(settings)
+        custom = self._cloudflare_custom_password(settings)
+        if not custom and mode in {'custom', 'password'}:
+            custom = admin
+        report['settings_snapshot'] = {
+            'api_base': base,
+            'auth_mode': mode,
+            'admin_password_set': bool(admin),
+            'custom_password_set': bool(custom),
+            'path_accounts': self._path(settings, 'cloudflare_path_accounts', '/api/new_address'),
+            'path_messages': self._path(settings, 'cloudflare_path_messages', '/api/mails'),
+            'default_domains': str(settings.get('cloudflare_default_domains') or ''),
+        }
+        if not base:
+            report['steps'].append({'step': 'config', 'ok': False, 'error': 'cloudflare_api_base is empty'})
+            report['hints'].append('填写 API Base，例如 https://em.woa.qzz.io')
+            return report
+
+        # Step 1: open settings (public)
+        try:
+            kwargs = {'timeout': 20}
+            proxy = str(settings.get('browser_proxy', '') or '').strip()
+            if proxy:
+                kwargs['proxies'] = {'http': proxy, 'https': proxy}
+            r = self.http.request('GET', f'{base}/open_api/settings', **kwargs)
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                body = {'raw': (r.text or '')[:300]}
+            need_auth = bool(body.get('needAuth')) if isinstance(body, dict) else None
+            report['steps'].append({
+                'step': 'open_api/settings',
+                'ok': r.status_code < 400,
+                'http_status': r.status_code,
+                'needAuth': need_auth,
+                'title': body.get('title') if isinstance(body, dict) else None,
+                'domains_sample': (body.get('domains') or body.get('defaultDomains') or [])[:5]
+                if isinstance(body, dict) else None,
+            })
+            if need_auth and not custom:
+                report['hints'].append(
+                    'Worker 返回 needAuth=true，必须填写 PASSWORDS（Custom Auth）并在鉴权中选择 password/Custom Auth'
+                )
+        except Exception as exc:
+            report['steps'].append({'step': 'open_api/settings', 'ok': False, 'error': str(exc)})
+
+        if not create_mailbox:
+            report['ok'] = any(s.get('ok') for s in report['steps'])
+            return report
+
+        # Step 2: create address
+        path = self._path(settings, 'cloudflare_path_accounts', '/api/new_address')
+        domain = self._next_cloudflare_domain(settings)
+        payload = {'name': self._random_username(), 'enablePrefix': True}
+        if domain:
+            payload['domain'] = domain
+        create_headers = self._cloudflare_headers(settings, json_body=True)
+        try:
+            r = self.http.request(
+                'POST', f'{base}{path}',
+                headers=create_headers,
+                params=self._query_auth(settings),
+                json=payload,
+                timeout=30,
+            )
+            try:
+                data = r.json()
+            except Exception:
+                data = {'raw': (r.text or '')[:500]}
+            nested = data.get('data') if isinstance(data, dict) and isinstance(data.get('data'), dict) else {}
+            address = ''
+            jwt = ''
+            if isinstance(data, dict):
+                address = str(data.get('address') or nested.get('address') or '')
+                jwt = str(
+                    data.get('jwt') or data.get('token')
+                    or nested.get('jwt') or nested.get('token') or ''
+                )
+            redacted_headers = {
+                k: ('***' if k.lower() in {'x-admin-auth', 'x-custom-auth', 'authorization'} else v)
+                for k, v in create_headers.items()
+            }
+            report['steps'].append({
+                'step': 'create_address',
+                'ok': r.status_code < 400 and bool(address) and bool(jwt),
+                'http_status': r.status_code,
+                'url': f'{base}{path}',
+                'request_headers': redacted_headers,
+                'request_body': payload,
+                'response_keys': sorted(list(data.keys())) if isinstance(data, dict) else [],
+                'address': address,
+                'jwt_present': bool(jwt),
+                'jwt_preview': (jwt[:16] + '…') if jwt else '',
+                'jwt_len': len(jwt),
+                'response_preview': str(data)[:600] if r.status_code >= 400 or not jwt else None,
+            })
+            if r.status_code == 401:
+                report['hints'].append(
+                    '创建地址 401：检查 ADMIN_PASSWORDS（x-admin-auth）与 PASSWORDS（x-custom-auth）是否与 Worker 环境变量一致'
+                )
+            if r.status_code < 400 and not jwt:
+                report['hints'].append(
+                    '创建成功但响应里没有 jwt/token 字段，收信必然 401。请把 response_keys 发出来'
+                )
+        except Exception as exc:
+            report['steps'].append({'step': 'create_address', 'ok': False, 'error': str(exc)})
+            address = ''
+            jwt = ''
+
+        if not list_mails or not jwt:
+            report['ok'] = any(
+                s.get('step') == 'create_address' and s.get('ok') for s in report['steps']
+            )
+            return report
+
+        # Step 3: list mails with mailbox JWT + optional x-custom-auth
+        mpath = self._path(settings, 'cloudflare_path_messages', '/api/mails')
+        mail_headers = self._cloudflare_mailbox_headers(jwt, settings)
+        redacted_mail = {
+            k: ('***' if k.lower() in {'x-admin-auth', 'x-custom-auth', 'authorization'} else v)
+            for k, v in mail_headers.items()
+        }
+        try:
+            r = self.http.request(
+                'GET', f'{base}{mpath}',
+                headers=mail_headers,
+                params={'limit': 5, 'offset': 0},
+                timeout=30,
+            )
+            try:
+                data = r.json()
+            except Exception:
+                data = {'raw': (r.text or '')[:500]}
+            items = self._pick_list(data) if r.status_code < 400 else []
+            report['steps'].append({
+                'step': 'list_mails',
+                'ok': r.status_code < 400,
+                'http_status': r.status_code,
+                'url': f'{base}{mpath}?limit=5&offset=0',
+                'request_headers': redacted_mail,
+                'mail_count': len(items) if isinstance(items, list) else None,
+                'response_preview': str(data)[:600],
+            })
+            if r.status_code == 401:
+                text = str(data)
+                if 'custom' in text.lower() or 'x-custom-auth' in text.lower() or not custom:
+                    report['hints'].append(
+                        '收信 401：Worker 启用了 PASSWORDS 时，/api/mails 必须同时带 '
+                        'Authorization: Bearer <jwt> 和 x-custom-auth: <PASSWORDS>。'
+                        '请在设置里填写 ② PASSWORDS，鉴权选 password/Custom Auth。'
+                    )
+                else:
+                    report['hints'].append(
+                        '收信 401：JWT 无效或过期，或 JWT_SECRET 与 Worker 不一致。'
+                        '请查看 list_mails.response_preview 原文。'
+                    )
+            report['ok'] = r.status_code < 400
+        except Exception as exc:
+            report['steps'].append({'step': 'list_mails', 'ok': False, 'error': str(exc)})
+
+        if report['ok']:
+            report['hints'].append('联调通过：创建地址 + 收信列表均成功。可开始注册。')
+        return report
+

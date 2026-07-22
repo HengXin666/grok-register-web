@@ -240,6 +240,10 @@ export async function render(container) {
                         ${field('s-cloudflare-path-token', 'Token 路径', s.cloudflare_path_token || '/api/token', { type: 'text', mono: true })}
                         ${field('s-cloudflare-path-messages', '邮件列表路径', s.cloudflare_path_messages || '/api/mails', { type: 'text', mono: true })}
                     </div>
+                    <div class="btn-group" style="margin-top:14px;gap:8px;flex-wrap:wrap">
+                        <button type="button" class="btn btn-secondary" id="cf-mail-test-btn">联调测试：创建邮箱 + 收信</button>
+                    </div>
+                    <pre id="cf-mail-test-result" class="mono" style="margin-top:12px;max-height:360px;overflow:auto;padding:12px;border-radius:10px;border:1px solid var(--border,#334);background:rgba(0,0,0,.25);font-size:12px;white-space:pre-wrap;display:none"></pre>
                 `)}
                 ${providerPanel('cloud_mail', `
                     <div class="settings-grid">
@@ -518,6 +522,7 @@ export async function render(container) {
     container.querySelector('#s-cloudflare-auth-mode')?.addEventListener('change', () => {
         updateCloudflareCustomPasswordVisibility(container);
     });
+    container.querySelector('#cf-mail-test-btn')?.addEventListener('click', () => testCloudflareMail(container));
     updateBackendSettings(container);
     bindBackendChoices(container);
 
@@ -559,6 +564,45 @@ function bindChoiceCards(root) {
         group.addEventListener('change', sync);
         sync();
     });
+}
+
+
+async function testCloudflareMail(root = document) {
+    const btn = root.querySelector('#cf-mail-test-btn');
+    const out = root.querySelector('#cf-mail-test-result');
+    if (btn) { btn.disabled = true; btn.textContent = '联调中…'; }
+    if (out) { out.style.display = 'block'; out.textContent = '正在请求 Worker…'; }
+    const payload = {
+        cloudflare_api_base: val('s-cloudflare-api-base').trim(),
+        cloudflare_admin_password: val('s-cloudflare-admin-password').trim(),
+        cloudflare_custom_password: val('s-cloudflare-custom-password').trim(),
+        cloudflare_api_key: val('s-cloudflare-admin-password').trim(),
+        cloudflare_auth_mode: val('s-cloudflare-auth-mode') || 'none',
+        cloudflare_default_domains: val('s-cloudflare-default-domains').trim(),
+        cloudflare_path_accounts: val('s-cloudflare-path-accounts').trim() || '/api/new_address',
+        cloudflare_path_messages: val('s-cloudflare-path-messages').trim() || '/api/mails',
+        cloudflare_path_domains: val('s-cloudflare-path-domains').trim() || '/api/domains',
+        cloudflare_path_token: val('s-cloudflare-path-token').trim() || '/api/token',
+        create_mailbox: true,
+        list_mails: true,
+    };
+    try {
+        const res = await api('POST', '/api/settings/cloudflare-mail/test', payload);
+        const report = res.data || {};
+        const text = JSON.stringify(report, null, 2);
+        if (out) out.textContent = text;
+        if (res.success || report.ok) {
+            showToast('Cloudflare 邮箱联调通过', 'success');
+        } else {
+            const hints = (report.hints || []).join('；') || res.message || '联调失败';
+            showToast(hints, 'error');
+        }
+    } catch (err) {
+        if (out) out.textContent = String(err?.message || err);
+        showToast(err?.message || '联调请求失败', 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '联调测试：创建邮箱 + 收信'; }
+    }
 }
 
 function updateCloudflareCustomPasswordVisibility(root = document) {

@@ -222,9 +222,12 @@ class TemporaryMailboxProviderInterfaceTest(unittest.TestCase):
 
     def test_cloudflare_mailbox_headers_use_jwt_only(self):
         """Reading mail must use mailbox JWT Bearer, not admin password."""
-        headers = TemporaryMailboxProviders._cloudflare_mailbox_headers('mailbox-jwt-xyz')
+        headers = TemporaryMailboxProviders._cloudflare_mailbox_headers(
+            'mailbox-jwt-xyz',
+            {'cloudflare_custom_password': 'PASS', 'cloudflare_auth_mode': 'custom'},
+        )
         self.assertEqual(headers.get('Authorization'), 'Bearer mailbox-jwt-xyz')
-        # admin password helpers must not appear
+        self.assertEqual(headers.get('x-custom-auth'), 'PASS')
         self.assertNotIn('x-admin-auth', headers)
 
     def test_cloudflare_fetch_messages_sends_bearer_jwt(self):
@@ -244,8 +247,9 @@ class TemporaryMailboxProviderInterfaceTest(unittest.TestCase):
              'cloudflare_path_messages': '/api/mails'},
         )
         self.assertEqual(captured['headers'].get('Authorization'), 'Bearer jwt-from-create')
+        # Custom Auth PASSWORDS must also be sent when configured
+        self.assertEqual(captured['headers'].get('x-custom-auth'), 'CUSTOM')
         self.assertNotIn('x-admin-auth', captured['headers'])
-        # query-key admin must not be mixed into mail list params
         self.assertEqual(captured['params'], {'limit': 20, 'offset': 0})
 
 
